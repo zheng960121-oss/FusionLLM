@@ -1,0 +1,46 @@
+# Build outputs
+*.o
+*.dylib
+*.so
+*.dll
+*.exe
+*.out
+*.app
+build/
+dist/
+
+# Compiled Swift binaries (PoC executables)
+pocs/poc1_happy_path
+pocs/poc1_page_fault_test
+pocs/poc1_test4_realistic
+pocs/poc4_kv_cache_ssd
+pocs/*.swiftdoc
+pocs/*.swiftmodule
+
+# llama.cpp build (when integrated)
+llama.cpp/build/
+llama.cpp/ggml/build/
+*.gguf
+
+# Models (large files)
+models/
+*.bin
+*.safetensors
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temp files
+/tmp/*.bin
+*.tmp
+
+# Benchmark raw data
+benchmarks/raw/

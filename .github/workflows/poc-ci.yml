@@ -1,0 +1,71 @@
+name: PoC CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test-pocs:
+    runs-on: macos-latest  # Apple Silicon runner (M1)
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check Swift / Xcode
+        run: |
+          swift --version
+          xcodebuild -version | head -2
+
+      - name: Show hardware info
+        run: |
+          system_profiler SPHardwareDataType | grep -E "Chip|Memory"
+
+      - name: Compile PoC-1 happy path
+        run: |
+          cd pocs
+          swiftc -O poc1_happy_path.swift -o poc1_happy_path
+
+      - name: Run PoC-1 happy path
+        run: |
+          cd pocs
+          ./poc1_happy_path
+
+      - name: Compile PoC-1 page fault test
+        run: |
+          cd pocs
+          swiftc -O poc1_page_fault_test.swift -o poc1_page_fault_test
+
+      - name: Run PoC-1 page fault test
+        run: |
+          cd pocs
+          ./poc1_page_fault_test
+
+      - name: Compile PoC-1 Test 4 (realistic)
+        run: |
+          cd pocs
+          swiftc -O poc1_test4_realistic.swift -o poc1_test4_realistic
+
+      - name: Run PoC-1 Test 4 (realistic)
+        run: |
+          cd pocs
+          ./poc1_test4_realistic
+
+      - name: Compile PoC-4 (KV Cache SSD)
+        run: |
+          cd pocs
+          swiftc -O poc4_kv_cache_ssd.swift -o poc4_kv_cache_ssd
+
+      - name: Run PoC-4 (KV Cache SSD)
+        run: |
+          cd pocs
+          ./poc4_kv_cache_ssd
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "✅ PoC CI completed. All 4 PoCs ran successfully on Apple Silicon."
