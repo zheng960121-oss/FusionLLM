@@ -108,9 +108,11 @@ def read_target_metadata(target_gguf_path: str) -> Dict[str, Any]:
         if len(field.types) >= 1:
             val = field.contents(field.types[0])
             meta[field.name] = val
-    # Also extract token count from ARRAY field
+    # Extract token count from tokenizer.ggml.tokens ARRAY field.
+    # The ReaderField.data is a list of indices into parts containing the actual
+    # string data, so len(data) == vocab size.
     if "tokenizer.ggml.tokens" in reader.fields:
-        meta["__token_count"] = len(reader.fields["tokenizer.ggml.tokens"].contents(reader.fields["tokenizer.ggml.tokens"].types[0]))
+        meta["__token_count"] = len(reader.fields["tokenizer.ggml.tokens"].data)
     return meta
 
 
