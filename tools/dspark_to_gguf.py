@@ -197,11 +197,7 @@ def get_target_n_vocab(target_meta: Dict[str, Any]) -> int:
 
 
 def get_target_head_dim(target_meta: Dict[str, Any]) -> int:
-    # head_dim 通常 = n_embd / n_head
-    n_embd = get_target_n_embd(target_meta)
-    n_head = get_target_n_head(target_meta)
-    if n_embd > 0 and n_head > 0:
-        return n_embd // n_head
+    # head_dim 优先用 metadata 里的 key_length (Qwen3 GQA: 32*128=4096 ≠ 2560)
     candidates = [
         "qwen3.attention.key_length",
         "qwen2.attention.key_length",
@@ -213,6 +209,11 @@ def get_target_head_dim(target_meta: Dict[str, Any]) -> int:
     for key in candidates:
         if key in target_meta:
             return int(target_meta[key])
+    # fallback: n_embd / n_head (MHA assumption, wrong for GQA)
+    n_embd = get_target_n_embd(target_meta)
+    n_head = get_target_n_head(target_meta)
+    if n_embd > 0 and n_head > 0:
+        return n_embd // n_head
     return 0
 
 
@@ -295,25 +296,63 @@ def read_pytorch_checkpoint(checkpoint_path: str) -> Dict[str, "np.ndarray"]:
     - 本地文件夹包含多个 .safetensors 文件（HF 格式）
     - 单个 .safetensors 文件
     - HF repo ID（如 "deepseek-ai/dspark_qwen3_4b_block7"）— 需要 huggingface_hub
+
+    BF16 → FP32 自动转换 (用 torch 加载，避开 numpy 的 bfloat16 限制).
     """
-    from safetensors import safe_open
+    # Use torch to load (handles bfloat16 natively, avoids numpy dtype issues).
+    try:
+        import torch
+        from safetensors.torch import load_file
+        use_torch = True
+    except ImportError:
+        use_torch = False
 
     path = Path(checkpoint_path)
-    tensors: Dict[str, np.ndarray] = {}
 
-    if path.is_dir():
-        # HF-style checkpoint dir with model-00001-of-N.safetensors + index.json
-        st_files = sorted(path.glob("*.safetensors"))
-        if not st_files:
-            raise FileNotFoundError(f"No .safetensors files in {checkpoint_path}")
+    def _load_with_torch(p: str) -> dict:
+        """Load via torch (handles bf16) and convert to fp32 numpy arrays."""
+        tensors = {}
+        if Path(p).is_dir():
+            st_files = sorted(Path(p).glob("*.safetensors"))
+        else:
+            st_files = [Path(p)]
+        for st_file in st_files:
+            sd = load_file(str(st_file))
+            for k, v in sd.items():
+                if v.dtype == torch.bfloat16:
+                    v = v.to(torch.float32)
+                tensors[k] = v.cpu().numpy().astype(np.float32)
+        return tensors
+
+    def _load_with_numpy(p: str) -> dict:
+        """Fallback: numpy (only handles fp32/fp16)."""
+        from safetensors import safe_open
+        tensors = {}
+        if Path(p).is_dir():
+            st_files = sorted(Path(p).glob("*.safetensors"))
+        else:
+            st_files = [Path(p)]
         for st_file in st_files:
             with safe_open(str(st_file), framework="np") as f:
                 for key in f.keys():
-                    tensors[key] = f.get_tensor(key)
+                    t = f.get_tensor(key)
+                    if t.dtype == np.float16:
+                        t = t.astype(np.float32)
+                    elif t.dtype == np.float64:
+                        t = t.astype(np.float32)
+                    else:
+                        t = t.astype(np.float32)
+                    tensors[key] = t
+        return tensors
+
+    if path.is_dir():
+        if use_torch:
+            return _load_with_torch(str(path))
+        return _load_with_numpy(str(path))
     elif path.is_file() and path.suffix == ".safetensors":
-        with safe_open(str(path), framework="np") as f:
-            for key in f.keys():
-                tensors[key] = f.get_tensor(key)
+        if use_torch:
+            return _load_with_torch(str(path))
+        return _load_with_numpy(str(path))
     else:
         # 尝试 HF repo ID
         try:
@@ -328,8 +367,6 @@ def read_pytorch_checkpoint(checkpoint_path: str) -> Dict[str, "np.ndarray"]:
             raise FileNotFoundError(
                 f"{checkpoint_path} is not a local file/dir, and huggingface_hub not installed"
             )
-
-    return tensors
 
 
 def get_pytorch_tensor(
@@ -441,16 +478,32 @@ def add_draft_tensors_from_state_dict(
     """从 PyTorch state_dict 提取 draft tensors 并写入 GGUF.
 
     quantize: None (F16) | "q4_0" | "q4_k_m"
+
+    支持 GQA (Qwen3 32 attention heads + 8 KV heads + head_dim=128).
     """
     target_n_embd = get_target_n_embd(target_meta)
     target_n_head = get_target_n_head(target_meta)
+    target_n_head_kv = get_target_n_head_kv(target_meta)
     target_n_vocab = get_target_n_vocab(target_meta)
     if target_n_embd == 0:
         raise ValueError(f"target_meta.n_embd == 0")
-    head_dim = target_n_embd // target_n_head if target_n_head > 0 else 128
+    # Use key_length from metadata if available (handles Qwen3 GQA where head_dim != n_embd/n_head)
+    head_dim = get_target_head_dim(target_meta)
+    if head_dim == 0:
+        head_dim = target_n_embd // target_n_head if target_n_head > 0 else 128
+
+    # GQA-aware dimensions
+    q_dim = target_n_head * head_dim           # = target_n_embd for MHA, 4096 for Qwen3-4B
+    kv_dim = target_n_head_kv * head_dim       # = 1024 for Qwen3-4B
+    # GQA detection: if kv_proj weight is [kv_dim, n_embd] instead of [n_embd, n_embd]
+    sample_k = state_dict.get("layers.0.self_attn.k_proj.weight")
+    is_gqa = sample_k is not None and sample_k.shape == (kv_dim, target_n_embd)
 
     num_layers = dspark_cfg["num_draft_layers"]
     rank = dspark_cfg["markov_rank"]
+
+    print(f"[draft tensors] {num_layers} layers, n_embd={target_n_embd}, q={q_dim}, kv={kv_dim}, "
+          f"head_dim={head_dim}, GQA={is_gqa}")
 
     tensors_added = 0
     tensors_missing = []
@@ -459,42 +512,40 @@ def add_draft_tensors_from_state_dict(
         nonlocal tensors_added, tensors_missing
         try:
             t = get_pytorch_tensor(state_dict, gguf_name, pytorch_keys)
-            t = t.astype(np.float32)  # always load as fp32 then convert below
+            t = t.astype(np.float32)
             if expected_shape is not None and t.shape != expected_shape:
-                print(f"  ⚠ {gguf_name}: shape mismatch {t.shape} vs expected {expected_shape}")
-            # Convert to fp16 by default, then quantize if requested
+                print(f"  ⚠ {gguf_name}: shape {t.shape} vs expected {expected_shape}")
             if quantize == "q4_0":
-                writer.add_tensor(gguf_name, t.astype(np.float32))  # gguf lib handles quantize
+                writer.add_tensor(gguf_name, t.astype(np.float32))
             elif quantize == "q4_k_m":
                 writer.add_tensor(gguf_name, t.astype(np.float32))
             else:
-                # F16
                 writer.add_tensor(gguf_name, t.astype(np.float16))
             tensors_added += 1
-        except KeyError as e:
+        except KeyError:
             tensors_missing.append((gguf_name, pytorch_keys))
 
-    # 1. Decoder layers
+    # 1. Decoder layers (GQA-aware shapes)
     for il in range(num_layers):
         write_tensor(
             f"layers.{il}.attn_q.weight",
             [f"layers.{il}.self_attn.q_proj.weight"],
-            (target_n_embd, target_n_embd),
+            (q_dim, target_n_embd),  # GQA: [n_head*head_dim, n_embd]
         )
         write_tensor(
             f"layers.{il}.attn_k.weight",
             [f"layers.{il}.self_attn.k_proj.weight"],
-            (target_n_embd, target_n_embd),
+            (kv_dim, target_n_embd),  # GQA: [n_head_kv*head_dim, n_embd]
         )
         write_tensor(
             f"layers.{il}.attn_v.weight",
             [f"layers.{il}.self_attn.v_proj.weight"],
-            (target_n_embd, target_n_embd),
+            (kv_dim, target_n_embd),
         )
         write_tensor(
             f"layers.{il}.attn_output.weight",
             [f"layers.{il}.self_attn.o_proj.weight"],
-            (target_n_embd, target_n_embd),
+            (target_n_embd, q_dim),  # GQA: [n_embd, n_head*head_dim]
         )
         write_tensor(
             f"layers.{il}.attn_q_norm.weight",
@@ -548,6 +599,7 @@ def add_draft_tensors_from_state_dict(
     )
 
     # 3. Markov head
+    # DSpark uses [V, rank] for both w1 and w2 (对称), not [rank, V]
     if rank > 0:
         write_tensor(
             "markov_head.markov_w1.weight",
@@ -557,7 +609,7 @@ def add_draft_tensors_from_state_dict(
         write_tensor(
             "markov_head.markov_w2.weight",
             ["markov_head.markov_w2.weight"],
-            (rank, target_n_vocab),
+            (target_n_vocab, rank),  # DSpark uses [V, rank] for w2 too
         )
 
     print(f"\n[draft tensors] added: {tensors_added}")
