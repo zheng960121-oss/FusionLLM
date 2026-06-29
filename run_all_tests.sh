@@ -71,6 +71,10 @@ echo "=== S4 Rejection Sampling ==="
 run_test "test-fusion-spec-decode"
 echo ""
 
+echo "=== S10 Spec Decode E2E ==="
+run_test "test-fusion-spec-e2e"
+echo ""
+
 echo "=== S5 Window ↔ Spec Decoding Coordination ==="
 run_test "test-fusion-window-spec-coord"
 echo ""
