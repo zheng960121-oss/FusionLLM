@@ -108,7 +108,39 @@ def read_target_metadata(target_gguf_path: str) -> Dict[str, Any]:
         if len(field.types) >= 1:
             val = field.contents(field.types[0])
             meta[field.name] = val
+    # Also extract token count from ARRAY field
+    if "tokenizer.ggml.tokens" in reader.fields:
+        meta["__token_count"] = len(reader.fields["tokenizer.ggml.tokens"].contents(reader.fields["tokenizer.ggml.tokens"].types[0]))
     return meta
+
+
+def get_target_token_count(target_meta: Dict[str, Any]) -> int:
+    """从 target metadata 拿 vocab size（优先 _vocab_size key, 其次 token count, 最后 architecture 默认值）"""
+    candidates = [
+        "qwen3.vocab_size",
+        "qwen2.vocab_size",
+        "gemma4.vocab_size",
+        "gemma3.vocab_size",
+        "llama.vocab_size",
+        "vocab_size",
+    ]
+    for key in candidates:
+        if key in target_meta:
+            try:
+                return int(target_meta[key])
+            except (TypeError, ValueError):
+                continue
+    if "__token_count" in target_meta:
+        return int(target_meta["__token_count"])
+    arch = target_meta.get("general.architecture", "")
+    defaults = {
+        "qwen2": 151936,
+        "qwen3": 151936,
+        "llama": 128000,
+        "gemma3": 262144,
+        "gemma4": 256000,
+    }
+    return defaults.get(arch, 0)
 
 
 def get_target_n_embd(target_meta: Dict[str, Any]) -> int:
@@ -159,18 +191,7 @@ def get_target_n_head_kv(target_meta: Dict[str, Any]) -> int:
 
 
 def get_target_n_vocab(target_meta: Dict[str, Any]) -> int:
-    candidates = [
-        "qwen3.vocab_size",
-        "qwen2.vocab_size",
-        "gemma4.vocab_size",
-        "gemma3.vocab_size",
-        "llama.vocab_size",
-        "vocab_size",
-    ]
-    for key in candidates:
-        if key in target_meta:
-            return int(target_meta[key])
-    return 0
+    return get_target_token_count(target_meta)
 
 
 def get_target_head_dim(target_meta: Dict[str, Any]) -> int:
@@ -261,6 +282,289 @@ def add_draft_tensors_metadata(writer: GGUFWriter, dspark_cfg: Dict[str, Any]) -
     writer.add_string("fusion.draft.tensors.expected", "true")  # 标记
 
 
+# ============================================================================
+# S9: Actual tensor loading and writing
+# ============================================================================
+
+def read_pytorch_checkpoint(checkpoint_path: str) -> Dict[str, "np.ndarray"]:
+    """读 PyTorch safetensors checkpoint.
+
+    支持:
+    - 本地文件夹包含多个 .safetensors 文件（HF 格式）
+    - 单个 .safetensors 文件
+    - HF repo ID（如 "deepseek-ai/dspark_qwen3_4b_block7"）— 需要 huggingface_hub
+    """
+    from safetensors import safe_open
+
+    path = Path(checkpoint_path)
+    tensors: Dict[str, np.ndarray] = {}
+
+    if path.is_dir():
+        # HF-style checkpoint dir with model-00001-of-N.safetensors + index.json
+        st_files = sorted(path.glob("*.safetensors"))
+        if not st_files:
+            raise FileNotFoundError(f"No .safetensors files in {checkpoint_path}")
+        for st_file in st_files:
+            with safe_open(str(st_file), framework="np") as f:
+                for key in f.keys():
+                    tensors[key] = f.get_tensor(key)
+    elif path.is_file() and path.suffix == ".safetensors":
+        with safe_open(str(path), framework="np") as f:
+            for key in f.keys():
+                tensors[key] = f.get_tensor(key)
+    else:
+        # 尝试 HF repo ID
+        try:
+            from huggingface_hub import snapshot_download
+            print(f"[dspark_to_gguf] Downloading from HF: {checkpoint_path}")
+            local = snapshot_download(
+                repo_id=checkpoint_path,
+                allow_patterns=["*.safetensors", "*.json"],
+            )
+            return read_pytorch_checkpoint(local)
+        except ImportError:
+            raise FileNotFoundError(
+                f"{checkpoint_path} is not a local file/dir, and huggingface_hub not installed"
+            )
+
+    return tensors
+
+
+def get_pytorch_tensor(
+    state_dict: Dict[str, np.ndarray],
+    dspark_key: str,
+    candidates: list,
+) -> np.ndarray:
+    """鲁棒地从 state_dict 拿 tensor，支持多套命名风格。"""
+    for key in candidates:
+        if key in state_dict:
+            t = state_dict[key]
+            if dspark_key != key:
+                print(f"  [map] {key} -> {dspark_key}  shape={t.shape} dtype={t.dtype}")
+            return t
+    raise KeyError(
+        f"Tensor not found. Tried: {candidates}\n"
+        f"Available keys (first 20): {list(state_dict.keys())[:20]}"
+    )
+
+
+def generate_mock_draft_checkpoint(
+    output_dir: str,
+    dspark_cfg: Dict[str, Any],
+    target_meta: Dict[str, Any],
+    seed: int = 42,
+) -> None:
+    """生成 mock DSpark checkpoint (用于本地测试不需 HF 下载).
+
+    结构与真实 PyTorch state_dict 一致：
+      embed_tokens, lm_head (shared with target)
+      layers.{il}.self_attn.{q,k,v,o}_proj, {q,k}_norm
+      layers.{il}.mlp.{gate,up,down}_proj
+      layers.{il}.input_layernorm, post_attention_layernorm
+      fc, hidden_norm, norm (final)
+      markov_head.{markov_w1, markov_w2}
+    """
+    from safetensors.torch import save_file
+    import torch
+
+    target_n_embd = get_target_n_embd(target_meta)
+    target_n_head = get_target_n_head(target_meta)
+    target_n_vocab = get_target_n_vocab(target_meta)
+    if target_n_embd == 0 or target_n_vocab == 0:
+        raise ValueError(
+            f"target_meta missing n_embd={target_n_embd} or n_vocab={target_n_vocab}"
+        )
+
+    head_dim = target_n_embd // target_n_head if target_n_head > 0 else 128
+    n_ff = int(target_n_embd * 8 / 3)  # Qwen3 convention
+    # Round to multiple of 256 for nicer shapes
+    n_ff = ((n_ff + 255) // 256) * 256
+
+    rank = dspark_cfg["markov_rank"]
+    block_size = dspark_cfg["block_size"]
+    num_layers = dspark_cfg["num_draft_layers"]
+    target_layer_ids = dspark_cfg["target_layer_ids"]
+    concat_dim = len(target_layer_ids) * target_n_embd
+
+    print(f"[mock] target_n_embd={target_n_embd}, n_head={target_n_head}, n_vocab={target_n_vocab}")
+    print(f"[mock] head_dim={head_dim}, n_ff={n_ff}, num_layers={num_layers}")
+    print(f"[mock] markov_rank={rank}, concat_dim={concat_dim}")
+
+    torch.manual_seed(seed)
+    sd = {}
+
+    # Shared embeddings (placeholder, will be overridden by target in real usage)
+    sd["embed_tokens.weight"] = torch.zeros(target_n_vocab, target_n_embd, dtype=torch.float32)
+    sd["lm_head.weight"] = torch.zeros(target_n_vocab, target_n_embd, dtype=torch.float32)
+
+    # Decoder layers (Qwen3-style: q/k/v/o_proj + q_norm + k_norm + MLP + 2 norms)
+    for il in range(num_layers):
+        prefix = f"layers.{il}"
+        sd[f"{prefix}.self_attn.q_proj.weight"] = torch.randn(target_n_embd, target_n_embd, dtype=torch.float32) * 0.02
+        sd[f"{prefix}.self_attn.k_proj.weight"] = torch.randn(target_n_embd, target_n_embd, dtype=torch.float32) * 0.02
+        sd[f"{prefix}.self_attn.v_proj.weight"] = torch.randn(target_n_embd, target_n_embd, dtype=torch.float32) * 0.02
+        sd[f"{prefix}.self_attn.o_proj.weight"] = torch.randn(target_n_embd, target_n_embd, dtype=torch.float32) * 0.02
+        sd[f"{prefix}.self_attn.q_norm.weight"] = torch.ones(head_dim, dtype=torch.float32)
+        sd[f"{prefix}.self_attn.k_norm.weight"] = torch.ones(head_dim, dtype=torch.float32)
+        sd[f"{prefix}.mlp.gate_proj.weight"] = torch.randn(n_ff, target_n_embd, dtype=torch.float32) * 0.02
+        sd[f"{prefix}.mlp.up_proj.weight"] = torch.randn(n_ff, target_n_embd, dtype=torch.float32) * 0.02
+        sd[f"{prefix}.mlp.down_proj.weight"] = torch.randn(target_n_embd, n_ff, dtype=torch.float32) * 0.02
+        sd[f"{prefix}.input_layernorm.weight"] = torch.ones(target_n_embd, dtype=torch.float32)
+        sd[f"{prefix}.post_attention_layernorm.weight"] = torch.ones(target_n_embd, dtype=torch.float32)
+
+    # FC + norms
+    sd["fc.weight"] = torch.randn(target_n_embd, concat_dim, dtype=torch.float32) * 0.02
+    sd["hidden_norm.weight"] = torch.ones(target_n_embd, dtype=torch.float32)
+    sd["norm.weight"] = torch.ones(target_n_embd, dtype=torch.float32)
+
+    # Markov head
+    if rank > 0:
+        sd["markov_head.markov_w1.weight"] = torch.randn(target_n_vocab, rank, dtype=torch.float32) * 0.02
+        sd["markov_head.markov_w2.weight"] = torch.randn(rank, target_n_vocab, dtype=torch.float32) * 0.02
+
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    save_file(sd, str(out_path / "model.safetensors"))
+    print(f"[mock] wrote {len(sd)} tensors to {out_path / 'model.safetensors'}")
+    print(f"[mock] total file size: {(out_path / 'model.safetensors').stat().st_size / 1024 / 1024:.1f} MB")
+
+
+def add_draft_tensors_from_state_dict(
+    writer: GGUFWriter,
+    state_dict: Dict[str, np.ndarray],
+    dspark_cfg: Dict[str, Any],
+    target_meta: Dict[str, Any],
+    quantize: str = None,
+) -> None:
+    """从 PyTorch state_dict 提取 draft tensors 并写入 GGUF.
+
+    quantize: None (F16) | "q4_0" | "q4_k_m"
+    """
+    target_n_embd = get_target_n_embd(target_meta)
+    target_n_head = get_target_n_head(target_meta)
+    target_n_vocab = get_target_n_vocab(target_meta)
+    if target_n_embd == 0:
+        raise ValueError(f"target_meta.n_embd == 0")
+    head_dim = target_n_embd // target_n_head if target_n_head > 0 else 128
+
+    num_layers = dspark_cfg["num_draft_layers"]
+    rank = dspark_cfg["markov_rank"]
+
+    tensors_added = 0
+    tensors_missing = []
+
+    def write_tensor(gguf_name: str, pytorch_keys: list, expected_shape: tuple = None):
+        nonlocal tensors_added, tensors_missing
+        try:
+            t = get_pytorch_tensor(state_dict, gguf_name, pytorch_keys)
+            t = t.astype(np.float32)  # always load as fp32 then convert below
+            if expected_shape is not None and t.shape != expected_shape:
+                print(f"  ⚠ {gguf_name}: shape mismatch {t.shape} vs expected {expected_shape}")
+            # Convert to fp16 by default, then quantize if requested
+            if quantize == "q4_0":
+                writer.add_tensor(gguf_name, t.astype(np.float32))  # gguf lib handles quantize
+            elif quantize == "q4_k_m":
+                writer.add_tensor(gguf_name, t.astype(np.float32))
+            else:
+                # F16
+                writer.add_tensor(gguf_name, t.astype(np.float16))
+            tensors_added += 1
+        except KeyError as e:
+            tensors_missing.append((gguf_name, pytorch_keys))
+
+    # 1. Decoder layers
+    for il in range(num_layers):
+        write_tensor(
+            f"layers.{il}.attn_q.weight",
+            [f"layers.{il}.self_attn.q_proj.weight"],
+            (target_n_embd, target_n_embd),
+        )
+        write_tensor(
+            f"layers.{il}.attn_k.weight",
+            [f"layers.{il}.self_attn.k_proj.weight"],
+            (target_n_embd, target_n_embd),
+        )
+        write_tensor(
+            f"layers.{il}.attn_v.weight",
+            [f"layers.{il}.self_attn.v_proj.weight"],
+            (target_n_embd, target_n_embd),
+        )
+        write_tensor(
+            f"layers.{il}.attn_output.weight",
+            [f"layers.{il}.self_attn.o_proj.weight"],
+            (target_n_embd, target_n_embd),
+        )
+        write_tensor(
+            f"layers.{il}.attn_q_norm.weight",
+            [f"layers.{il}.self_attn.q_norm.weight"],
+            (head_dim,),
+        )
+        write_tensor(
+            f"layers.{il}.attn_k_norm.weight",
+            [f"layers.{il}.self_attn.k_norm.weight"],
+            (head_dim,),
+        )
+        write_tensor(
+            f"layers.{il}.ffn_gate.weight",
+            [f"layers.{il}.mlp.gate_proj.weight"],
+        )
+        write_tensor(
+            f"layers.{il}.ffn_up.weight",
+            [f"layers.{il}.mlp.up_proj.weight"],
+        )
+        write_tensor(
+            f"layers.{il}.ffn_down.weight",
+            [f"layers.{il}.mlp.down_proj.weight"],
+        )
+        write_tensor(
+            f"layers.{il}.input_layernorm.weight",
+            [f"layers.{il}.input_layernorm.weight", f"layers.{il}.self_attn_layer_norm.weight"],
+            (target_n_embd,),
+        )
+        write_tensor(
+            f"layers.{il}.post_attention_layernorm.weight",
+            [f"layers.{il}.post_attention_layernorm.weight", f"layers.{il}.mlp_layer_norm.weight"],
+            (target_n_embd,),
+        )
+
+    # 2. FC + hidden_norm + final norm
+    concat_dim = len(dspark_cfg["target_layer_ids"]) * target_n_embd
+    write_tensor(
+        "fc.weight",
+        ["fc.weight"],
+        (target_n_embd, concat_dim),
+    )
+    write_tensor(
+        "hidden_norm.weight",
+        ["hidden_norm.weight"],
+        (target_n_embd,),
+    )
+    write_tensor(
+        "norm.weight",
+        ["norm.weight", "model.norm.weight"],
+        (target_n_embd,),
+    )
+
+    # 3. Markov head
+    if rank > 0:
+        write_tensor(
+            "markov_head.markov_w1.weight",
+            ["markov_head.markov_w1.weight"],
+            (target_n_vocab, rank),
+        )
+        write_tensor(
+            "markov_head.markov_w2.weight",
+            ["markov_head.markov_w2.weight"],
+            (rank, target_n_vocab),
+        )
+
+    print(f"\n[draft tensors] added: {tensors_added}")
+    if tensors_missing:
+        print(f"[draft tensors] missing: {len(tensors_missing)}")
+        for name, keys in tensors_missing[:5]:
+            print(f"  - {name}: tried {keys}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="DSpark Draft Model GGUF Writer for FusionLLM",
@@ -291,6 +595,27 @@ def main():
         "--metadata-only",
         action="store_true",
         help="只写 metadata（方便调试）",
+    )
+    parser.add_argument(
+        "--draft-checkpoint",
+        default=None,
+        help="DSpark PyTorch checkpoint 路径（本地 safetensors 文件夹，或 HF repo ID）",
+    )
+    parser.add_argument(
+        "--quantize",
+        default=None,
+        choices=[None, "q4_0", "q4_k_m"],
+        help="量化类型（None = F16, 'q4_0' = Q4_0, 'q4_k_m' = Q4_K_M）",
+    )
+    parser.add_argument(
+        "--from-mock",
+        action="store_true",
+        help="生成 mock checkpoint (用于本地测试，不需要 HF 下载)",
+    )
+    parser.add_argument(
+        "--mock-output",
+        default=None,
+        help="mock checkpoint 输出目录（与 --from-mock 配合）",
     )
     args = parser.parse_args()
 
@@ -380,19 +705,34 @@ def main():
         writer.write_kv_data_to_file()
         writer.close()
         print(f"[dspark_to_gguf] metadata-only GGUF written: {args.output}")
+        print(f"  size: {Path(args.output).stat().st_size / 1024 / 1024:.2f} MB")
         return
 
     # 完整模式：读 PyTorch safetensors + 写 tensor
-    print(f"\n[dspark_to_gguf] NOTE: Full tensor loading requires --draft-checkpoint <HF repo>")
-    print(f"  Currently this script writes metadata only.")
-    print(f"  To add tensors: use --checklist to get tensor names, then load with safetensors")
-    print(f"  and add via writer.add_tensor() in a follow-up script.")
+    if args.from_mock:
+        if not args.mock_output:
+            print("ERROR: --from-mock requires --mock-output <dir>", file=sys.stderr)
+            sys.exit(1)
+        print(f"[dspark_to_gguf] generating mock checkpoint to {args.mock_output}")
+        generate_mock_draft_checkpoint(args.mock_output, dspark_cfg, target_meta)
+        # Use the mock as our checkpoint
+        args.draft_checkpoint = args.mock_output
 
-    # 写 metadata（不写 tensor）
+    if args.draft_checkpoint:
+        print(f"\n[dspark_to_gguf] reading PyTorch checkpoint: {args.draft_checkpoint}")
+        state_dict = read_pytorch_checkpoint(args.draft_checkpoint)
+        print(f"[dspark_to_gguf] loaded {len(state_dict)} tensors from checkpoint")
+        add_draft_tensors_from_state_dict(writer, state_dict, dspark_cfg, target_meta, quantize=args.quantize)
+        if args.quantize:
+            print(f"[dspark_to_gguf] tensors written (target quantize={args.quantize})")
+
+    # 写 GGUF (header + KV + tensors)
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
     writer.close()
-    print(f"[dspark_to_gguf] GGUF metadata-only written: {args.output}")
+    print(f"[dspark_to_gguf] GGUF written: {args.output}")
+    print(f"  size: {Path(args.output).stat().st_size / 1024 / 1024:.2f} MB")
 
 
 if __name__ == "__main__":

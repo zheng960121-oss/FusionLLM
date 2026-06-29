@@ -13,11 +13,25 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LLAMA_DIR="${LLAMA_DIR:-$HOME/Desktop/llama.cpp-fusionllm}"
 QWEN05B="$LLAMA_DIR/models/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+DSPARK_GGUF="${DSPARK_GGUF:-/tmp/dspark_qwen3_4b.gguf}"
+DSPARK_MOCK_DIR="${DSPARK_MOCK_DIR:-/tmp/mock_dspark}"
 
 export DYLD_LIBRARY_PATH="$LLAMA_DIR/build/bin"
 
 # Build first
 "$SCRIPT_DIR/build_fusion_tests.sh" > /dev/null 2>&1
+
+# Generate DSpark GGUF if not present (uses mock weights from --from-mock)
+if [ ! -f "$DSPARK_GGUF" ]; then
+    echo "[setup] generating DSpark GGUF via tools/dspark_to_gguf.py --from-mock ..."
+    python3 "$SCRIPT_DIR/tools/dspark_to_gguf.py" \
+        --draft-config qwen3_4b \
+        --target-gguf "$QWEN05B" \
+        --output "$DSPARK_GGUF" \
+        --from-mock \
+        --mock-output "$DSPARK_MOCK_DIR" 2>&1 | tail -3
+    echo ""
+fi
 
 pass=0
 fail=0
@@ -50,9 +64,7 @@ run_test "test-fusion-hs-extract" "$QWEN05B"
 echo ""
 
 echo "=== S3 FusionDSparkModel (loading) ==="
-# Requires DSpark-format GGUF (block_size, markov_rank, etc.)
-# Not yet runnable without tools/dspark_to_gguf.py output (S9)
-run_test "test-fusion-draft-model" "$QWEN05B" || echo "  (expected: needs DSpark GGUF, see tools/dspark_to_gguf.py)"
+run_test "test-fusion-draft-model" "$DSPARK_GGUF"
 echo ""
 
 echo "=== S4 Rejection Sampling ==="
