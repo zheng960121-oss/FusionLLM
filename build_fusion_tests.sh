@@ -95,6 +95,7 @@ build_test "test-fusion-window-spec-coord" "$test_window_spec_extras"  "1"
 build_test "test-fusion-spec-decode"       "$test_spec_decode_extras"  "1"
 build_test "test-fusion-spec-e2e"           "$test_spec_decode_extras"  "1"
 build_test "test-fusion-draft-model"        "$test_draft_model_extras"  "1"
+build_test "test-fusion-dspark-forward-real" "$test_draft_model_extras" "1"
 build_test "test-fusion-hs-extract"         "$test_hs_extract_extras"   "1"
 
 echo ""

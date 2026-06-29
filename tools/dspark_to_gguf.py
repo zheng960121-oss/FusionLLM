@@ -508,16 +508,15 @@ def add_draft_tensors_from_state_dict(
     tensors_added = 0
     tensors_missing = []
 
-    def write_tensor(gguf_name: str, pytorch_keys: list, expected_shape: tuple = None):
+    def write_tensor(gguf_name: str, pytorch_keys: list, expected_shape: tuple = None, dtype: str = "f16"):
+        """Write a tensor. dtype: 'f16' (default for weights) or 'f32' (for norm weights)."""
         nonlocal tensors_added, tensors_missing
         try:
             t = get_pytorch_tensor(state_dict, gguf_name, pytorch_keys)
             t = t.astype(np.float32)
             if expected_shape is not None and t.shape != expected_shape:
                 print(f"  ⚠ {gguf_name}: shape {t.shape} vs expected {expected_shape}")
-            if quantize == "q4_0":
-                writer.add_tensor(gguf_name, t.astype(np.float32))
-            elif quantize == "q4_k_m":
+            if quantize in ("q4_0", "q4_k_m") or dtype == "f32":
                 writer.add_tensor(gguf_name, t.astype(np.float32))
             else:
                 writer.add_tensor(gguf_name, t.astype(np.float16))
@@ -551,11 +550,13 @@ def add_draft_tensors_from_state_dict(
             f"layers.{il}.attn_q_norm.weight",
             [f"layers.{il}.self_attn.q_norm.weight"],
             (head_dim,),
+            dtype="f32",  # norm weights must be F32 for ggml_mul
         )
         write_tensor(
             f"layers.{il}.attn_k_norm.weight",
             [f"layers.{il}.self_attn.k_norm.weight"],
             (head_dim,),
+            dtype="f32",
         )
         write_tensor(
             f"layers.{il}.ffn_gate.weight",
@@ -573,11 +574,13 @@ def add_draft_tensors_from_state_dict(
             f"layers.{il}.input_layernorm.weight",
             [f"layers.{il}.input_layernorm.weight", f"layers.{il}.self_attn_layer_norm.weight"],
             (target_n_embd,),
+            dtype="f32",
         )
         write_tensor(
             f"layers.{il}.post_attention_layernorm.weight",
             [f"layers.{il}.post_attention_layernorm.weight", f"layers.{il}.mlp_layer_norm.weight"],
             (target_n_embd,),
+            dtype="f32",
         )
 
     # 2. FC + hidden_norm + final norm
@@ -591,11 +594,13 @@ def add_draft_tensors_from_state_dict(
         "hidden_norm.weight",
         ["hidden_norm.weight"],
         (target_n_embd,),
+        dtype="f32",
     )
     write_tensor(
         "norm.weight",
         ["norm.weight", "model.norm.weight"],
         (target_n_embd,),
+        dtype="f32",
     )
 
     # 3. Markov head
@@ -610,6 +615,7 @@ def add_draft_tensors_from_state_dict(
             "markov_head.markov_w2.weight",
             ["markov_head.markov_w2.weight"],
             (target_n_vocab, rank),  # DSpark uses [V, rank] for w2 too
+            dtype="f32",  # vocab × rank matrices: keep F32 for matmul stability
         )
 
     print(f"\n[draft tensors] added: {tensors_added}")
