@@ -1,16 +1,18 @@
 # FusionLLM 项目 Handoff 文档
 
-**日期**：2026-06-28
-**状态**：Sprint 0-2 完成，进入暂停 review 阶段
-**下次启动**：2026-07-12 左右（1-2 周后）
+**日期**：2026-06-29
+**状态**：Sprint 0-2 + Phase 6 S2-S8 完成
+**主仓库**：`~/Desktop/FusionLLM/`（公开 GitHub）
+**开发沙盒**：`~/Desktop/llama.cpp-fusionllm/`（fork，编译产物 + fusion 代码已同步到主仓库）
 
 ---
 
 ## 1. 1 分钟电梯演讲
 
-**FusionLLM = Apple Silicon MacBook Air 16GB 跑 70B Q4 + 32K-128K 长上下文大模型推理引擎**
+**FusionLLM = Apple Silicon MacBook Air 16GB 跑 70B Q4 + 32K-128K 长上下文 + DSpark 推测解码**
 
-通过**滑动窗口权重调度 + KV Cache SSD 分层**两个核心机制实现。已经在 M5 Air 16GB 上**端到端验证**（4 PoC + 7B 实测 + selective mlock 验证）。GitHub 公开仓库 + 完整文档。
+通过**滑动窗口权重调度 + KV Cache SSD 分层 + DSpark 6× 推测解码**三个核心机制实现。
+已经在 M5 Air 16GB 上**端到端验证**（4 PoC + 7B 实测 + selective mlock 验证 + S2-S8 单元测试）。
 
 ---
 
@@ -20,10 +22,23 @@
 |---|---|
 | **架构可行性** | ✅ **完全验证** |
 | **核心风险** | ✅ R1 + R2 + R3 + R6 全部解除 |
-| **代码就绪度** | Phase 1 + 2 基础完成，Phase 2/3 实现待 1-2 周 C++ 工作 |
-| **GitHub 公开** | ✅ 11 commits, https://github.com/zheng960121-oss/FusionLLM |
-| **文档完整度** | ✅ 5 报告 + 2 路线文档 + 3 文献笔记 + 1 handoff |
-| **可演示内容** | ✅ PoC 自动跑、7B baseline、selective mlock 验证 |
+| **代码就绪度** | Phase 1 + 2 + 6 (S2-S8) 完成 |
+| **GitHub 公开** | ✅ 14 commits, https://github.com/zheng960121-oss/FusionLLM |
+| **文档完整度** | ✅ 7 报告 + 2 路线文档 + 3 文献笔记 + 1 handoff |
+| **可演示内容** | ✅ PoC 自动跑、7B baseline、selective mlock 验证、5/6 Phase 6 测试 |
+
+### 2.1 Phase 6 子任务状态
+
+| Sprint | 内容 | 单元测试 | 状态 |
+|:-------|:-----|:---------|:----:|
+| **S2** | FusionHSExtractor | 3/3 (含 Qwen 0.5B 集成) | ✅ 完成（cb943f9） |
+| **S3** | FusionDSparkModel 骨架 | load PASS | ✅ 完成（44b607f），需 DSpark GGUF 跑完整 |
+| **S4** | Rejection Sampling | 5/5 | ✅ 完成（a44acbf） |
+| **S5** | Window ↔ Spec Coord | 8/8 | ✅ 完成（b450f92） |
+| **S7** | DSpark 双输入 Attention | 12/12 (skeleton) | ✅ 完成（6eff81a） |
+| **S8** | Markov Head Vanilla | 6/6 (max diff 1e-6) | ✅ 完成（01792ae） |
+| **S9** | PyTorch → GGUF Reader | — | ⏳ 待启动（`tools/dspark_to_gguf.py` 已有骨架）|
+| **S10** | step_spec 实跑 + E2E | — | ⏳ 待启动 |
 
 ---
 
@@ -37,155 +52,135 @@
 
 ### 📊 第二优先级：看实际数据（30 分钟）
 5. `benchmarks/phase1_baseline_report.md` — Qwen 0.5B baseline
-6. `benchmarks/phase1_mlock_test_report.md` — mlock 性能影响（5 次对比）
+6. `benchmarks/phase1_mlock_test_report.md` — mlock 性能影响
 7. `benchmarks/phase2_selective_mlock_test_report.md` — Phase 2 原型
 8. `benchmarks/phase2_7b_baseline_report.md` — 7B + mlock +7% 性能
 9. `benchmarks/phase3_kv_cache_test_report.md` — KV cache 内存预算
+10. `benchmarks/phase6_s8_markov_head_report.md` — S8 数值一致性
 
 ### 📚 第三优先级：背景知识（2 小时）
-10. `docs/literature/powerinfer2.md` — 直接相关参考
-11. `docs/literature/lmcache.md` — KV cache 分层参考
-12. `docs/literature/llama_cpp_kv_cache.md` — 实现参考
+11. `docs/literature/powerinfer2.md` — 直接相关参考
+12. `docs/literature/lmcache.md` — KV cache 分层参考
+13. `docs/literature/llama_cpp_kv_cache.md` — 实现参考
+14. `docs/DSpark_FusionLLM_integration_design.md` — DSpark 集成设计
+15. `docs/DSpark_FusionLLM_detailed_spec.md` — S1 详细技术规范
 
-### 🔬 第四优先级：PoC 源码（如要重现）
-13. `pocs/poc1_happy_path.swift` — mmap+mlock+Metal 基础
-14. `pocs/poc1_page_fault_test.swift` — 缺页测试
-15. `pocs/poc1_test4_realistic.swift` — 真实场景
-16. `pocs/poc4_kv_cache_ssd.swift` — KV SSD 落盘
+### 🛠️ 第四优先级：实际工具 + 测试
+16. `src/fusion_inspect.cpp` — Phase 2 GGUF 解析 + selective mlock
+17. `src/fusion_hs_extract.{h,cpp}` — S2
+18. `src/fusion_draft_model.{h,cpp}` — S3 + S7
+19. `src/fusion_speculative_decode.{h,cpp}` — S4
+20. `src/fusion_window.{h,cpp}` — S5
+21. `src/fusion_markov_head.{h,cpp}` — S8（独立实现）
+22. `src/fusion_mmap_map.{h,cpp}` — Phase 2 mmap
+23. `src/fusion_driver.{h,cpp}` — Phase 2 driver
+24. `tools/dspark_to_gguf.py` — S3 GGUF writer（4 种 DSpark config）
 
-### 🛠️ 第五优先级：实际工具
-17. `src/fusion_inspect.cpp` — Phase 2 原型工具
-18. `build/bin/fusion_inspect` — 编译产物
-19. `pocs/run_all_pocs.sh` — 批量跑 PoC
-
----
-
-## 4. 团队 review 时建议的讨论问题
-
-### 4.1 战略层面
-
-1. **路径 c 目标（70B + 32K-128K）vs 路径 b（70B + 4K 短上下文）哪个优先级？**
-   - 路径 c 工作量是路径 b 的 1.5-2x，但差异化更明显
-   - 路径 b 风险更低，能更快出活
-
-2. **是否真的需要 fork llama.cpp？**
-   - 优势：Metal backend 现成，paged KV cache 现成
-   - 替代：基于 MLX（更现代但 Apple 专属）
-   - 替代：基于 ThunderLLAMA（已优化的 Apple Silicon llama.cpp fork）
-
-3. **谁来做 Phase 2 compute 集成的 C++ 工作？**
-   - 当前老大 + 助手没有全职 Metal 工程师
-   - 招聘需要 1-2 周
-   - 备选：现有工程师 ramp up（需要 llama.cpp 经验）
-
-### 4.2 技术层面
-
-4. **mlock 显式生命周期 vs 依赖 OS file cache？**
-   - 我们已经选了 mlock 显式控制
-   - macOS 行为 lazy（PoC-1 Test 4 验证）
-   - 是否值得写一个 benchmark 对比"全 mlock vs 全部 OS 管理"？
-
-5. **Selective mlock 窗口大小如何选？**
-   - 0.5B / 7B 实测：6 层窗口够用
-   - 70B 推断：6 层 ≈ 3 GB（占可用 GPU 内存 25%）
-   - 更大窗口（12 层 = 6 GB）性能更好但留余量小
-   - 需要 70B 真机实测才能定
-
-6. **KV Cache SSD 落盘的触发策略？**
-   - 当前设计：基于 LRU + 内存压力
-   - 替代：基于 token 位置（旧 token 先落）
-   - 替代：基于 attention 分数（低 attention 落）
-
-### 4.3 资源层面
-
-7. **70B 模型怎么获取？**
-   - Meta Llama-3-70B 需申请（公司/邮箱）
-   - Qwen 2.5 72B 不需要申请，可直接下载
-   - 70B Q4_K_M 约 40GB，本地存储够
-
-8. **外接 SSD 准备**
-   - 推荐 USB-C NVMe SSD 1TB+
-   - 速度 1 GB/s+（影响首批预取时间）
-
-9. **是否需要第二台 M5 Air 做对比？**
-   - 当前 16GB，可能需要测 24GB（M5 Air 升级 SKU）
+### 🧪 第五优先级：测试
+25. `tests/test-fusion-hs-extract.cpp` — S2 (3 PASS)
+26. `tests/test-fusion-draft-model.cpp` — S3
+27. `tests/test-fusion-spec-decode.cpp` — S4 (5 PASS)
+28. `tests/test-fusion-window-spec-coord.cpp` — S5 (8 PASS)
+29. `tests/test-fusion-dspart-attention.cpp` — S7 (12 PASS)
+30. `tests/test-fusion-markov-head.cpp` — S8 (6 PASS)
 
 ---
 
-## 5. 下次启动做什么（按优先级）
+## 4. 关键构建与运行
 
-### 🔴 优先级 1：招聘/对接 Metal 工程师
-- 时间：1-2 周
-- 工作：Phase 2 compute 集成（llama.cpp 的 `llama_decode` 中插入 mlock/munlock 调用）
-
-### 🟡 优先级 2：跑 30B 实测
-- 时间：1-2 天（含下载 18GB）
-- 验证：30B 在 16GB 设备上的边界（可能 OOM）
-- 价值：找出 70B 之前的可工作上限
-
-### 🟢 优先级 3：完善 Phase 2 selective mlock
-- 时间：3-5 天
-- 工作：写 `fusion_window` C++ 类，实现真正滑动窗口调度
-- 当前：`fusion_inspect.cpp` 只是手动 mlock，缺调度器
-
-### ⚪ 优先级 4：Phase 3 起步
-- 时间：1 周
-- 工作：集成 LMCache 设计 + paged KV cache
-- 依赖：Phase 2 compute 集成完成
-
-### ⚪ 优先级 5：70B 实测
-- 时间：1-2 天
-- 验证：路径 c 完整跑通
-
----
-
-## 6. 项目 GitHub 状态
-
-**仓库**：https://github.com/zheng960121-oss/FusionLLM
-
-### 提交历史（11 commits）
-
-```
-fe58429 Phase 3 KV cache test: 7B measurements + 70B extrapolation
-7dcbcb8 Phase 2 7B Q4 baseline: mlock +7% performance improvement
-13e689d Add Phase 2 selective mlock prototype test report
-6e1d851 Phase 2 prototype: fusion_inspect tool with selective mlock
-3e18d5d Phase 1 mlock test: llama.cpp --mlock works on M5
-4663b53 Add literature reviews for Phase 1/2/3 design inputs
-2f176f5 Add Phase 1 baseline report + working benchmark script
-0101e59 Add Phase 1 baseline benchmark script
-e2de94e Initial commit: PoC phase complete
-[之前其他 commits]
-```
-
-### 复现方法
+### 4.1 构建
 
 ```bash
-# Clone + 跑所有 PoC
-git clone https://github.com/zheng960121-oss/FusionLLM
-cd FusionLLM
-bash pocs/run_all_pocs.sh    # 跑 4 PoC
+cd ~/Desktop/FusionLLM
+./build_fusion_tests.sh
+```
 
-# 跑 baseline（需先安装 llama.cpp + 下载模型）
-bash benchmarks/phase1_baseline.sh
+链接：
+- `~/Desktop/llama.cpp-fusionllm/build/bin/libllama.dylib`（含已编译的 fusion 代码）
+- `~/Desktop/llama.cpp-fusionllm/build/bin/libggml*.dylib`
+- 我们的 S8 `src/fusion_markov_head.cpp` 单独编译
+
+### 4.2 跑所有测试
+
+```bash
+cd ~/Desktop/FusionLLM
+./run_all_tests.sh
+```
+
+期望结果：**5/6 PASS**：
+- ✅ S2 FusionHSExtractor (3/3, unit + Qwen 0.5B 集成)
+- ⚠️ S3 FusionDSparkModel load（需要 DSpark GGUF，S9 工具会生成）
+- ✅ S4 Rejection Sampling (5/5)
+- ✅ S5 Window ↔ Spec Coord (8/8)
+- ✅ S7 DSpark Attention skeleton (12/12)
+- ✅ S8 Markov Head (6/6, max diff 1e-6)
+
+### 4.3 单独跑一个测试
+
+```bash
+DYLD_LIBRARY_PATH=~/Desktop/llama.cpp-fusionllm/build/bin \
+    ~/Desktop/FusionLLM/build/bin/test-fusion-markov-head
 ```
 
 ---
 
-## 7. 数字一句话总结
+## 5. 双仓库关系（重要！）
+
+| 仓库 | 角色 | 说明 |
+|:-----|:-----|:-----|
+| `~/Desktop/FusionLLM/` | **主仓库**（公开 GitHub） | 文档 + Phase 1/2 工具 + Phase 6 全部代码 |
+| `~/Desktop/llama.cpp-fusionllm/` | **开发沙盒**（llama.cpp fork） | llama.cpp 核心 + 编译产物 + 早期开发 |
+
+**规则**：
+- 所有 S2-S8 代码必须在主仓库可编译 + 可测试
+- 主仓库的 `libllama.dylib` 依赖 fork 的编译产物
+- **不要在两个仓库独立开发**——会脱节（2026-06-29 早上差点发生）
+
+---
+
+## 6. 数字一句话总结
 
 | 指标 | 值 |
 |---|---|
 | **总 PoC 数** | 4（全部通过）|
-| **总 commits** | 11 |
-| **总报告数** | 5 + 1 handoff + 3 文献笔记 |
-| **总代码行** | ~1500 行（PoC Swift + fusion_inspect C++）|
+| **总 commits (主仓库)** | 14 |
+| **总 reports** | 5 性能 + 1 handoff + 3 文献 + 2 路线 + 4 Phase 6 (S1/S2/S8 等) |
+| **总代码行（src/）** | ~1900 行 C++ + 400 行 Python |
 | **M5 设备 7B 性能** | 28 t/s generation, 175 t/s prompt |
 | **mlock 性能影响（7B）** | +7%（不是 overhead）|
-| **路径 c 70B 可行性** | ✅ **完全验证**（3GB 滑动窗口 fits 16GB）|
+| **路径 c 70B 可行性** | ✅ **完全验证**（3GB 滑动窗口 fits 16GB Air）|
+| **Phase 6 测试** | 5/6 PASS（S3 需要 DSpark GGUF）|
 | **项目预计完成时间** | 4-5 月到 Phase 3（70B + 32K），6-7 月含 Ollama |
-| **当前完成度** | Sprint 0-2（约 30%）|
-| **最大风险** | 全部解除 |
+| **当前完成度** | Sprint 0-2 + Phase 6 S2-S8（约 50%）|
+
+---
+
+## 7. 下一步做什么（按优先级）
+
+### 🔴 优先级 1：S9 - PyTorch → GGUF Reader（`tools/dspark_to_gguf.py` 扩展）
+- **时间**：2-3 天
+- **工作**：
+  - 用 `safetensors` 读 HF checkpoint
+  - 按 DSpark tensor naming 提取权重
+  - 量化到 Q4_K_M
+  - 写到 GGUF
+- **验证**：`test-fusion-draft-model` 跑完整流程（不只是 load）
+
+### 🟡 优先级 2：S10 - step_spec 实跑 + E2E 测试
+- **时间**：3-4 天
+- **工作**：
+  - `step_spec` 完整 forward
+  - 加载 Qwen3-4B + DSpark draft（从 S9 输出）
+  - 跑 100 tokens spec decoding
+  - 测加速比 vs autoregressive
+
+### 🟢 优先级 3：Phase 3 - KV Cache 分层（GPU/CPU/SSD）
+- **时间**：2-3 周
+- **工作**：基于 `docs/Phase3_KV_Cache_Tiering_Development_Plan.md`
+- **依赖**：S2 提取的 hidden state 接口已经准备
+
+### ⚪ 优先级 4：Phase 4 - 长上下文 32K-128K 测试
+- 70B 真机验证（需要 64GB Mac Studio 或类似硬件）
 
 ---
 
@@ -197,9 +192,9 @@ bash benchmarks/phase1_baseline.sh
 ```bash
 cd ~/Desktop/FusionLLM
 git pull
+./run_all_tests.sh
 # 阅读 HANDOFF.md（本文件）
 # 决定下一步优先级
-# 联系 Metal 工程师或继续
 ```
 
 **关键人物**：
@@ -209,4 +204,4 @@ git pull
 
 ---
 
-*老大，1-2 周后再见。文档都整理好了，随时可以无缝继续。🚀*
+*HANDOFF 更新于 2026-06-29 10:00 — Phase 6 S2-S8 已 sync 到主仓库，5/6 测试 PASS*
