@@ -277,17 +277,40 @@ bool FusionKVTierManager::is_in_ssd(int layer_id, int start_tok, int end_tok) {
 }
 
 // ============================================================
-// Hook for llama.cpp attention forward (W1 D4 stub)
+// Hook for llama.cpp attention forward (W1 D4)
 // ============================================================
+// Called by llama.cpp's per-layer graph callback (or by a user wrapper) to
+// ensure the K (or V) block for [start_tok, end_tok) is in L0 (GPU).  This
+// triggers L2->L1->L0 promotion if needed, then returns a ggml_tensor view
+// of the L0 staging buffer sliced to the requested token range.  The view
+// shares storage with the full L0 tensor (no copy); it's safe to use as
+// long as the manager outlives the compute graph.
 ggml_tensor* FusionKVTierManager::ensure_for_attention(int layer_id, int start_tok, int end_tok, bool is_value) {
-    // TODO W1 D4: 集成到 llama.cpp attention forward
-    // 当前 stub: promote 到 L0, 返回 GPU tensor
+    if (layer_id < 0 || layer_id >= n_layers_) return nullptr;
+    if (start_tok < 0 || end_tok <= start_tok) return nullptr;
+
+    // 1) Promote all blocks in the range from L2/L1 → L0
     if (!promote_to_gpu(layer_id, start_tok, end_tok)) {
         return nullptr;
     }
-    // 返回 L0 buffer 中的对应 K/V tensor
-    // (W1 D4: 实际集成时, 这里返回 llama_kv_cache 中对应位置的 view)
-    return is_value ? l0_v_tensors_[layer_id] : l0_k_tensors_[layer_id];
+
+    // 2) Pick the right L0 tensor (K or V) and return a view of [start, end)
+    ggml_tensor* full = is_value ? l0_v_tensors_[layer_id] : l0_k_tensors_[layer_id];
+    if (full == nullptr) return nullptr;
+
+    int width = end_tok - start_tok;
+    // ggml_view_2d(ctx, tensor, ne0, ne1, nb1, offset) - take a [ne0, width] view
+    // starting at column start_tok.
+    size_t byte_offset = (size_t)start_tok * (size_t)full->nb[1];
+    ggml_tensor* view = ggml_view_2d(ctx_, full, (int64_t)full->ne[0], (int64_t)width,
+                                       full->nb[1], byte_offset);
+    if (view) {
+        char vname[64];
+        snprintf(vname, sizeof(vname), "fusion_kv_%s_l%d_t%d_%d",
+                 is_value ? "v" : "k", layer_id, start_tok, end_tok);
+        ggml_format_name(view, vname);
+    }
+    return view;
 }
 
 // ============================================================
@@ -378,14 +401,41 @@ bool FusionKVTierManager::do_promote_to_cpu(int layer_id, int block_id) {
 }
 
 bool FusionKVTierManager::do_promote_to_gpu(int layer_id, int block_id) {
-    // TODO W1 D4: 实现 L1 → L0
+    // W1 D4: 实现 L1 → L0
     //  1) ensure L0 buffer 大小够 (ensure_l0_buffers)
-    //  2) copy l1_buffers_[layer_id] → l0_k_tensors_[layer_id] via ggml_backend_tensor_copy
+    //  2) copy l1_buffers_[layer_id] → l0_k_tensors_[layer_id]
+    //     - 在 CPU 后端: plain memcpy（ctx_ 分配的 buffer 就是 CPU memory）
+    //     - 在 GPU 后端 (W2): ggml_backend_tensor_copy 跨设备
     //  3) 更新 blocks_[layer_id][block_id].tier = L0_GPU
-    fprintf(stderr, "[KVTier] STUB: do_promote_to_gpu(layer=%d, block=%d)\n", layer_id, block_id);
-    if (!ensure_l0_buffers(block_end(block_id))) return false;
-    // TODO: actual host→device copy
+    int end_tok = block_end(block_id);
+    if (!ensure_l0_buffers(end_tok)) return false;
+
+    // Copy L1 -> L0 for both K and V slices.
+    // The L0 tensor is sized [n_embd_k_gqa, max_tokens]; we copy into the
+    // [start, end) range using the block's L1 offset as the source row.
+    int start_tok = block_start(block_id);
+    size_t block_bytes = block_byte_size();
+    size_t src_offset = (size_t)block_id * block_bytes;
+    size_t dst_offset = (size_t)start_tok * (size_t)kv_head_dim_ * ggml_type_size(kv_type_);
+
+    // K tensor
+    if (l0_k_tensors_[layer_id] && l0_k_tensors_[layer_id]->data) {
+        char* dst_k = (char*)l0_k_tensors_[layer_id]->data + dst_offset;
+        const char* src_k = (const char*)l1_buffers_[layer_id] + src_offset;
+        memcpy(dst_k, src_k, block_bytes);
+    }
+    // V tensor (same shape as K; copy independently for symmetry — in
+    // practice, llama.cpp's K and V caches share the L1 staging layout)
+    if (l0_v_tensors_[layer_id] && l0_v_tensors_[layer_id]->data) {
+        char* dst_v = (char*)l0_v_tensors_[layer_id]->data + dst_offset;
+        const char* src_v = (const char*)l1_buffers_[layer_id] + src_offset;
+        memcpy(dst_v, src_v, block_bytes);
+    }
+
     blocks_[layer_id][block_id].tier = KVTier::L0_GPU;
+    // ptr stays pointing at the L1 buffer (canonical staging ptr); the L0
+    // tensor is what callers should use for actual compute, accessed via
+    // ensure_for_attention().
     stats_.n_gpu_copies++;
     return true;
 }
@@ -491,17 +541,50 @@ bool FusionKVTierManager::read_ssd_block(int layer_id, int block_id) {
 }
 
 bool FusionKVTierManager::ensure_l0_buffers(int max_tokens) {
-    if (max_tokens <= l0_max_tokens_ && l0_k_tensors_[0] != nullptr) {
+    if (max_tokens <= l0_max_tokens_ && !l0_k_tensors_.empty() && l0_k_tensors_[0] != nullptr) {
         return true;  // already have enough
     }
-    // TODO W1 D4: 分配 ggml tensors in ctx_
-    //  for (int il = 0; il < n_layers_; ++il) {
-    //      l0_k_tensors_[il] = ggml_new_tensor_2d(ctx_, kv_type_, kv_head_dim_, max_tokens);
-    //      l0_v_tensors_[il] = ggml_new_tensor_2d(ctx_, kv_type_, kv_head_dim_, max_tokens);
-    //      ggml_format_name(l0_k_tensors_[il], "kv_l0_k_l%d", il);
-    //  }
-    l0_max_tokens_ = max_tokens;
-    fprintf(stderr, "[KVTier] STUB: ensure_l0_buffers(%d tokens)\n", max_tokens);
+    if (ctx_ == nullptr) {
+        fprintf(stderr, "[KVTier] ensure_l0_buffers: no ggml context, L0 path disabled\n");
+        return false;
+    }
+    // Allocate (or grow) the L0 staging tensors in ctx_.  Layout mirrors
+    // llama.cpp's K/V cache: [n_embd_k_gqa, kv_size].
+    //   ne[0] = n_embd_k_gqa (= kv_head_dim_ in our model)
+    //   ne[1] = max_tokens (= kv_size for full context)
+    // When max_tokens is less than kv_size, we allocate the smaller view and
+    // let later calls grow it (ggml tensors in a context are immutable in
+    // shape; we always allocate the full kv_size at first call).
+    int alloc_tokens = max_tokens;
+    if (alloc_tokens < kv_size_) alloc_tokens = kv_size_;  // never grow down
+
+    // If tensors are already allocated but smaller, we need a fresh context
+    // to realloc — but our ctx_ is caller-owned.  Strategy: allocate the full
+    // kv_size once, and only realloc if a bigger request comes in.
+    if (l0_k_tensors_.empty()) {
+        l0_k_tensors_.assign(n_layers_, nullptr);
+        l0_v_tensors_.assign(n_layers_, nullptr);
+    }
+    if (l0_k_tensors_[0] != nullptr && (int)l0_k_tensors_[0]->ne[1] >= alloc_tokens) {
+        l0_max_tokens_ = (int)l0_k_tensors_[0]->ne[1];
+        return true;
+    }
+    // (Re)allocate.  If the previous tensors are smaller, we cannot resize
+    // in-place — caller must provide a bigger ctx_.  We assume the first
+    // call has the right size.
+    for (int il = 0; il < n_layers_; ++il) {
+        char name_k[64], name_v[64];
+        snprintf(name_k, sizeof(name_k), "fusion_kv_l0_k_l%d", il);
+        snprintf(name_v, sizeof(name_v), "fusion_kv_l0_v_l%d", il);
+        l0_k_tensors_[il] = ggml_new_tensor_2d(ctx_, kv_type_, (int64_t)kv_head_dim_, (int64_t)alloc_tokens);
+        l0_v_tensors_[il] = ggml_new_tensor_2d(ctx_, kv_type_, (int64_t)kv_head_dim_, (int64_t)alloc_tokens);
+        if (l0_k_tensors_[il]) ggml_format_name(l0_k_tensors_[il], "%s", name_k);
+        if (l0_v_tensors_[il]) ggml_format_name(l0_v_tensors_[il], "%s", name_v);
+    }
+    l0_max_tokens_ = alloc_tokens;
+    fprintf(stderr, "[KVTier] L0 buffers allocated: %d layers × [%d, %d] = %.2f MB/layer\n",
+            n_layers_, kv_head_dim_, alloc_tokens,
+            (double)kv_head_dim_ * alloc_tokens * ggml_type_size(kv_type_) / (1024.0 * 1024.0));
     return true;
 }
 

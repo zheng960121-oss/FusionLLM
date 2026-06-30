@@ -79,6 +79,10 @@ echo "=== Phase 3 W1 KV Tier Manager ==="
 run_test "test-fusion-kv-tier"
 echo ""
 
+echo "=== Phase 3 W1 D4 KV Tier × llama_context integration ==="
+run_test "test-fusion-kv-tier-integration" "$QWEN05B"
+echo ""
+
 echo "=== S5 Window ↔ Spec Decoding Coordination ==="
 run_test "test-fusion-window-spec-coord"
 echo ""

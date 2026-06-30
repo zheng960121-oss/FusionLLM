@@ -352,6 +352,103 @@ static void test_multi_layer() {
 }
 
 // ============================================================
+// ============================================================
+// Test 5b: L0 path + ensure_for_attention (W1 D4)
+// ============================================================
+// Verifies the W1 D4 GPU staging path: ensure_l0_buffers actually allocates
+// ggml tensors, do_promote_to_gpu copies L1 data into the L0 tensor buffer,
+// and ensure_for_attention returns a correctly-shaped 2D view that the
+// llama.cpp integration can use as the K (or V) input to attention.
+static void test_l0_ensure_for_attention() {
+    printf("\n=== Test 5b: L0 path + ensure_for_attention (W1 D4) ===\n");
+    const int n_layers = 2;
+    const int kv_size = 256;
+    const int head_dim = 16;
+    const int block_size = 64;
+
+    // Use a real (alloc'ing) ggml context so the L0 tensors actually have
+    // a data buffer for memcpy.  The kv_tier manager writes to it.
+    size_t ctx_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 8
+                    + 64 * 1024 * 1024;  // 64 MB for L0 staging
+    ggml_init_params params = { ctx_size, nullptr, false /* no_alloc=false */ };
+    ggml_context* ctx = ggml_init(params);
+    EXPECT(ctx != nullptr, "ggml_init OK (alloc mode)");
+
+    fusion::FusionKVTierManager mgr(ctx, n_layers, kv_size, head_dim, GGML_TYPE_F32, block_size);
+
+    // (1) L0 buffers will be allocated lazily by promote_to_gpu
+    auto s0 = mgr.get_stats();
+    EXPECT(s0.bytes_in_gpu == 0, "L0 starts empty");
+
+    // (2) Write a known pattern to L1, promote to L0, verify the L0 tensor
+    // data matches what we wrote.
+    int n_elements_per_block = block_size * head_dim;
+    std::mt19937 rng(7777);
+    std::normal_distribution<float> nd(0.0f, 2.0f);
+    // Promote block 0 of layer 0 first (L2→L1), then we can write into L1
+    EXPECT(mgr.promote_to_cpu(0, 0, block_size), "promote L2→L1 first");
+    float* l1_ptr = (float*)mgr.get(0, 0, block_size).ptr;
+    EXPECT(l1_ptr != nullptr, "L1 ptr valid");
+    for (int i = 0; i < n_elements_per_block; ++i) l1_ptr[i] = nd(rng);
+
+    // Now promote to L0 (L1→L0 should copy L1 data into the L0 tensor)
+    EXPECT(mgr.promote_to_gpu(0, 0, block_size), "promote L1→L0");
+
+    // (3) Call ensure_for_attention and check the returned view
+    ggml_tensor* k_view = mgr.ensure_for_attention(0, 0, block_size, false /* K */);
+    EXPECT(k_view != nullptr, "ensure_for_attention returned non-null K view");
+    if (k_view) {
+        EXPECT(k_view->ne[0] == head_dim, "K view ne[0] = head_dim");
+        EXPECT(k_view->ne[1] == block_size, "K view ne[1] = block_size");
+        EXPECT(k_view->type == GGML_TYPE_F32, "K view type = F32");
+        // Read back data and compare
+        const float* view_data = (const float*)k_view->data;
+        EXPECT(view_data != nullptr, "K view has data");
+        if (view_data) {
+            std::mt19937 rng2(7777);
+            std::normal_distribution<float> nd2(0.0f, 2.0f);
+            bool data_matches = true;
+            for (int i = 0; i < n_elements_per_block; ++i) {
+                float expected = nd2(rng2);
+                if (std::fabs(view_data[i] - expected) > 1e-5f) {
+                    data_matches = false; break;
+                }
+            }
+            EXPECT(data_matches, "K view data matches L1 source (L1→L0 copy works)");
+        }
+    }
+
+    // (4) V view test
+    ggml_tensor* v_view = mgr.ensure_for_attention(0, 0, block_size, true /* V */);
+    EXPECT(v_view != nullptr, "ensure_for_attention returned non-null V view");
+    if (v_view) {
+        EXPECT(v_view->ne[0] == head_dim, "V view ne[0] = head_dim");
+        EXPECT(v_view->ne[1] == block_size, "V view ne[1] = block_size");
+    }
+
+    // (5) Ensure for attention with different range returns correct slice
+    ggml_tensor* k_view2 = mgr.ensure_for_attention(1, 0, block_size, false);
+    EXPECT(k_view2 != nullptr, "K view for layer 1");
+    if (k_view2) {
+        EXPECT(k_view2->ne[1] == block_size, "layer-1 K view ne[1] = block_size");
+        // L1 was zero (never written for layer 1), so L0 should also be zero
+        if (k_view2->data) {
+            const float* d = (const float*)k_view2->data;
+            int zero_count = 0;
+            for (int i = 0; i < n_elements_per_block; ++i) if (d[i] == 0.0f) zero_count++;
+            EXPECT(zero_count == n_elements_per_block, "layer-1 K view zero (no source data)");
+        }
+    }
+
+    // (6) Invalid range should return nullptr
+    ggml_tensor* bad = mgr.ensure_for_attention(0, -1, 0, false);
+    EXPECT(bad == nullptr, "invalid range returns nullptr");
+    bad = mgr.ensure_for_attention(-1, 0, 1, false);
+    EXPECT(bad == nullptr, "invalid layer returns nullptr");
+
+    ggml_free(ctx);
+}
+
 // Test 6: Stats 统计
 // ============================================================
 static void test_stats() {
@@ -483,6 +580,7 @@ int main(int argc, char** argv) {
     test_ssd_roundtrip();
     test_real_ssd_files();
     test_multi_layer();
+    test_l0_ensure_for_attention();
     test_stats();
     test_large_kv();
     test_sliding_window();

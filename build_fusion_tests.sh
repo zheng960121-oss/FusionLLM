@@ -107,6 +107,7 @@ build_test "test-fusion-draft-model"        "$test_draft_model_extras"  "1"
 build_test "test-fusion-dspark-forward-real" "$test_draft_model_extras" "1"
 build_test "test-fusion-hs-extract"         "$test_hs_extract_extras"   "1"
 build_test "test-fusion-kv-tier"            "$SCRIPT_DIR/build/obj/fusion_kv_tier.o"  "0"
+build_test "test-fusion-kv-tier-integration" "$SCRIPT_DIR/build/obj/fusion_kv_tier.o"  "1"
 
 echo ""
 echo "=== Build complete ==="

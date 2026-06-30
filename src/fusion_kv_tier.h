@@ -34,6 +34,9 @@ extern "C" {
 #include "ggml.h"
 }
 
+// C-compatible opaque type for the tier manager (C API uses this name)
+typedef struct fusion_kv_tier fusion_kv_tier_t;
+
 namespace fusion {
 
 // ============================================================
@@ -174,6 +177,14 @@ public:
     void reset_stats();
 
     // ============================================================
+    // Accessors for llama.cpp integration
+    // ============================================================
+    // The bridge needs to know the per-layer kv_size to pre-warm the cache.
+    // All layers share the same kv_size in our model, so a single getter
+    // suffices.
+    int kv_size_for_layer() const { return kv_size_; }
+
+    // ============================================================
     // Debug / Logging
     // ============================================================
     void print_summary() const;
@@ -244,5 +255,41 @@ private:
 };
 
 }  // namespace fusion
+
+// ============================================================
+// C-linkage bridge for llama.cpp integration
+// ============================================================
+// llama.cpp links against this C API to attach / detach a tier manager from
+// a llama_context.  The actual hook lives in graph_get_cb() and dispatches
+// to FusionKVTierManager::ensure_for_attention() per layer per forward.
+//
+// Forward declaration of llama_context so we don't need to include
+// llama.h here (keeps fusion_kv_tier.h standalone-buildable).
+struct llama_context;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Attach a tier manager to a llama_context.  Pass mgr=nullptr to detach.
+// After this call, the context's per-layer graph callback will call
+// ensure_for_attention() for every layer in every forward.
+// Note: mgr must outlive ctx (the context stores a raw pointer; we don't
+// take ownership).
+void fusion_kv_tier_attach(struct llama_context* ctx, fusion_kv_tier_t* mgr);
+
+// Check if a tier manager is attached (returns 1 if yes, 0 if no)
+int fusion_kv_tier_is_attached(struct llama_context* ctx);
+
+// C++ accessor: returns the attached manager for ctx, or nullptr if none.
+// Used by llama_context's graph_get_cb() to dispatch per-layer calls.
+namespace fusion {
+class FusionKVTierManager;
+FusionKVTierManager* fusion_kv_tier_get_attached(struct llama_context* ctx);
+}  // namespace fusion
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // FUSION_KV_TIER_H
