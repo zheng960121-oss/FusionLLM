@@ -77,6 +77,14 @@ FusionKVTierManager::FusionKVTierManager(
     l0_v_tensors_.resize(n_layers_, nullptr);
     l0_max_tokens_ = 0;
 
+    // 3b) Per-forward debounce state — MUST be initialized in constructor;
+    //     mark_layer_in_current_forward() reads layer_seen_in_forward_[il]
+    //     and accesses current_forward_id_; if either is uninitialized the
+    //     first llama_decode's hook will crash (D6 32K hang root cause).
+    layer_seen_in_forward_.assign(n_layers_, 0);
+    forward_id_         = 0;
+    current_forward_id_ = 0;
+
     // 4) SSD paths + file descriptors
     ssd_file_paths_.resize(n_layers_);
     ssd_mmapped_.resize(n_layers_, nullptr);
@@ -331,6 +339,26 @@ bool FusionKVTierManager::flush_to_ssd(int layer_id, int start_tok, int end_tok)
     int b = block_id(start_tok);
     if (b < 0 || b >= (int)blocks_[layer_id].size()) return false;
     return write_ssd_block(layer_id, b);
+}
+
+// ============================================================
+// Per-forward debounce
+// ============================================================
+void FusionKVTierManager::begin_forward() {
+    current_forward_id_ = ++forward_id_;
+    fprintf(stderr, "[KVTier] begin_forward: id=%zu\n", (size_t)current_forward_id_);
+    // mark_layer_in_current_forward compares layer_seen_in_forward_[i]
+    // against current_forward_id_; mismatched = "not seen in this forward".
+    // No memset needed; the comparison is the source of truth.
+}
+
+bool FusionKVTierManager::mark_layer_in_current_forward(int layer_id) {
+    if (layer_id < 0 || layer_id >= n_layers_) return false;
+    if ((uint64_t)(unsigned char)layer_seen_in_forward_[layer_id] == current_forward_id_) {
+        return false;  // already touched in this forward
+    }
+    layer_seen_in_forward_[layer_id] = (char)(unsigned char)current_forward_id_;
+    return true;  // first touch in this forward
 }
 
 // ============================================================

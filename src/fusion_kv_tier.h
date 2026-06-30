@@ -185,6 +185,15 @@ public:
     int kv_size_for_layer() const { return kv_size_; }
     int sliding_window_size() const { return sliding_window_size_ > 0 ? sliding_window_size_ : kv_size_ / 4; }
 
+    // Per-forward debounce: returns true the FIRST time it's called for a
+    // given layer_id within the current llama_decode.  The llama.cpp hook
+    // calls this in its per-tensor per-layer callback; we touch the
+    // ensure_for_attention path only once per layer per forward to avoid
+    // re-running view_2d + format_name for every tensor in the graph.
+    // begin_forward() (called from llama_decode) resets the seen-set.
+    bool mark_layer_in_current_forward(int layer_id);
+    void begin_forward();
+
     // ============================================================
     // Debug / Logging
     // ============================================================
@@ -222,6 +231,11 @@ private:
 
     // Sliding window
     int sliding_window_size_ = 0;
+
+    // Per-forward debounce state
+    uint64_t forward_id_ = 0;
+    uint64_t current_forward_id_ = 0;
+    std::vector<char> layer_seen_in_forward_;  // size = n_layers_, indexed by layer_id
 
     // Stats
     mutable Stats stats_{};
