@@ -240,6 +240,13 @@ private:
         // 但我们以 token × head_dim 为单位
         return (size_t) block_size_ * kv_head_dim_ * ggml_type_size(kv_type_);
     }
+    // Actual byte size of block `block_id` (last block may be shorter than
+    // block_byte_size if kv_size_ is not a multiple of block_size_).  Use
+    // this for read/write size at the SSD I/O boundary.
+    size_t actual_block_bytes(int block_id) const {
+        int n_tokens = block_end(block_id) - block_start(block_id);
+        return (size_t) n_tokens * (size_t) kv_head_dim_ * ggml_type_size(kv_type_);
+    }
 
     // Promote/demote 实现
     bool do_promote_to_cpu(int layer_id, int block_id);

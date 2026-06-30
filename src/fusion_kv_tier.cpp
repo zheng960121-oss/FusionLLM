@@ -299,8 +299,19 @@ ggml_tensor* FusionKVTierManager::ensure_for_attention(int layer_id, int start_t
     if (full == nullptr) return nullptr;
 
     int width = end_tok - start_tok;
-    // ggml_view_2d(ctx, tensor, ne0, ne1, nb1, offset) - take a [ne0, width] view
-    // starting at column start_tok.
+    // L0 may be capped (see ensure_l0_buffers); clamp the view to the actual
+    // L0 tensor size so ggml_view_2d doesn't trip the OOB assert.
+    if (start_tok >= (int)full->ne[1]) {
+        // Caller wants data outside the L0 cap.  We can't return a valid L0
+        // view; return nullptr and let the caller fall back to the L1 buffer
+        // (which is also valid CPU memory).  llama.cpp's own KV cache is
+        // unaffected — this hook is best-effort.
+        return nullptr;
+    }
+    if (start_tok + width > (int)full->ne[1]) {
+        width = (int)full->ne[1] - start_tok;
+        if (width <= 0) return nullptr;
+    }
     size_t byte_offset = (size_t)start_tok * (size_t)full->nb[1];
     ggml_tensor* view = ggml_view_2d(ctx_, full, (int64_t)full->ne[0], (int64_t)width,
                                        full->nb[1], byte_offset);
@@ -410,10 +421,19 @@ bool FusionKVTierManager::do_promote_to_gpu(int layer_id, int block_id) {
     int end_tok = block_end(block_id);
     if (!ensure_l0_buffers(end_tok)) return false;
 
-    // Copy L1 -> L0 for both K and V slices.
-    // The L0 tensor is sized [n_embd_k_gqa, max_tokens]; we copy into the
-    // [start, end) range using the block's L1 offset as the source row.
+    // L0 has a cap (see ensure_l0_buffers).  If this block's range exceeds
+    // the L0 capacity, skip the L0 copy — the block stays in L1 (CPU) and
+    // the caller's view in ensure_for_attention() will be a smaller slice.
     int start_tok = block_start(block_id);
+    if (start_tok >= l0_max_tokens_) {
+        // Block doesn't fit in L0.  Mark as L1 instead and skip the copy.
+        blocks_[layer_id][block_id].tier = KVTier::L1_CPU;
+        return true;  // not an error, just no GPU copy
+    }
+
+    // Copy L1 -> L0 for both K and V slices.
+    // The L0 tensor is sized [n_embd_k_gqa, l0_max_tokens_]; we copy into the
+    // [start, end) range using the block's L1 offset as the source row.
     size_t block_bytes = block_byte_size();
     size_t src_offset = (size_t)block_id * block_bytes;
     size_t dst_offset = (size_t)start_tok * (size_t)kv_head_dim_ * ggml_type_size(kv_type_);
@@ -466,9 +486,9 @@ bool FusionKVTierManager::write_ssd_block(int layer_id, int block_id) {
         return true;
     }
     int fd = ssd_fds_[layer_id];
-    size_t bsz = block_byte_size();
-    size_t buffer_offset = (size_t)block_id * bsz;
-    off_t file_offset = ssd_block_offset(block_id, bsz);
+    size_t bsz = actual_block_bytes(block_id);
+    size_t buffer_offset = (size_t)block_id * block_byte_size();  // file-aligned offset
+    off_t file_offset = ssd_block_offset(block_id, block_byte_size());
 
     // pwrite is thread-safe; we don't need a lock for concurrent writers to
     // different blocks because each block has a unique file offset.
@@ -488,17 +508,17 @@ bool FusionKVTierManager::write_ssd_block(int layer_id, int block_id) {
 bool FusionKVTierManager::read_ssd_block(int layer_id, int block_id) {
     if (ssd_fds_.empty() || layer_id >= (int)ssd_fds_.size() || ssd_fds_[layer_id] < 0) {
         // No SSD path set — zero-fill destination so caller gets deterministic data
-        size_t bsz = block_byte_size();
-        size_t buffer_offset = (size_t)block_id * bsz;
+        size_t bsz = actual_block_bytes(block_id);
+        size_t buffer_offset = (size_t)block_id * block_byte_size();
         if (!l1_buffers_.empty() && l1_buffers_[layer_id]) {
             memset((char*)l1_buffers_[layer_id] + buffer_offset, 0, bsz);
         }
         return true;
     }
     int fd = ssd_fds_[layer_id];
-    size_t bsz = block_byte_size();
-    size_t buffer_offset = (size_t)block_id * bsz;
-    off_t file_offset = ssd_block_offset(block_id, bsz);
+    size_t bsz = actual_block_bytes(block_id);
+    size_t buffer_offset = (size_t)block_id * block_byte_size();  // file-aligned offset
+    off_t file_offset = ssd_block_offset(block_id, block_byte_size());
 
     // Read into the L1 buffer at the block's offset
     ssize_t got = pread(fd, (char*)l1_buffers_[layer_id] + buffer_offset,
@@ -548,15 +568,15 @@ bool FusionKVTierManager::ensure_l0_buffers(int max_tokens) {
         fprintf(stderr, "[KVTier] ensure_l0_buffers: no ggml context, L0 path disabled\n");
         return false;
     }
-    // Allocate (or grow) the L0 staging tensors in ctx_.  Layout mirrors
-    // llama.cpp's K/V cache: [n_embd_k_gqa, kv_size].
-    //   ne[0] = n_embd_k_gqa (= kv_head_dim_ in our model)
-    //   ne[1] = max_tokens (= kv_size for full context)
-    // When max_tokens is less than kv_size, we allocate the smaller view and
-    // let later calls grow it (ggml tensors in a context are immutable in
-    // shape; we always allocate the full kv_size at first call).
+    // L0 staging cap.  Allocating a per-layer ggml tensor of size
+    // [head_dim × kv_size] for every layer explodes Metal memory at long
+    // contexts (16K → 306 MB just for L0, on top of 312 MB compute buffer).
+    // Cap L0 at this many tokens; callers needing longer ranges will get a
+    // smaller L0 view + the rest stays in L1 (CPU) or L2 (SSD).  W2 will
+    // add sliding-window-aware ranges that only need the hot subset.
+    static constexpr int L0_TOKENS_CAP = 4096;
     int alloc_tokens = max_tokens;
-    if (alloc_tokens < kv_size_) alloc_tokens = kv_size_;  // never grow down
+    if (alloc_tokens > L0_TOKENS_CAP) alloc_tokens = L0_TOKENS_CAP;
 
     // If tensors are already allocated but smaller, we need a fresh context
     // to realloc — but our ctx_ is caller-owned.  Strategy: allocate the full
@@ -569,9 +589,6 @@ bool FusionKVTierManager::ensure_l0_buffers(int max_tokens) {
         l0_max_tokens_ = (int)l0_k_tensors_[0]->ne[1];
         return true;
     }
-    // (Re)allocate.  If the previous tensors are smaller, we cannot resize
-    // in-place — caller must provide a bigger ctx_.  We assume the first
-    // call has the right size.
     for (int il = 0; il < n_layers_; ++il) {
         char name_k[64], name_v[64];
         snprintf(name_k, sizeof(name_k), "fusion_kv_l0_k_l%d", il);
@@ -582,9 +599,10 @@ bool FusionKVTierManager::ensure_l0_buffers(int max_tokens) {
         if (l0_v_tensors_[il]) ggml_format_name(l0_v_tensors_[il], "%s", name_v);
     }
     l0_max_tokens_ = alloc_tokens;
-    fprintf(stderr, "[KVTier] L0 buffers allocated: %d layers × [%d, %d] = %.2f MB/layer\n",
+    fprintf(stderr, "[KVTier] L0 buffers allocated: %d layers × [%d, %d] = %.2f MB/layer (cap=%d)\n",
             n_layers_, kv_head_dim_, alloc_tokens,
-            (double)kv_head_dim_ * alloc_tokens * ggml_type_size(kv_type_) / (1024.0 * 1024.0));
+            (double)kv_head_dim_ * alloc_tokens * ggml_type_size(kv_type_) / (1024.0 * 1024.0),
+            L0_TOKENS_CAP);
     return true;
 }
 
