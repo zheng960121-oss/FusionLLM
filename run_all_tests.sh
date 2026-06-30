@@ -75,6 +75,10 @@ echo "=== S10 Spec Decode E2E ==="
 run_test "test-fusion-spec-e2e"
 echo ""
 
+echo "=== Phase 3 W1 KV Tier Manager ==="
+run_test "test-fusion-kv-tier"
+echo ""
+
 echo "=== S5 Window ↔ Spec Decoding Coordination ==="
 run_test "test-fusion-window-spec-coord"
 echo ""
