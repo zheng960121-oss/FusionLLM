@@ -67,13 +67,14 @@ public:
     );
 
     // 单步 spec decode（内部接口，也可以外部调用测试）
+    // target_kv/draft_kv 留作未来扩展（目前 KV 都在 llama_context 内部管理）
     SpecDecodeStep step_spec(
         std::vector<int32_t>& output_ids,           // 当前已接受的 tokens
         int32_t& start,                              // 当前生成位置
         float temperature,
-        const std::vector<int32_t>& stop_token_ids,
-        llama_kv_cache& target_kv,
-        llama_kv_cache& draft_kv
+        const std::vector<int32_t>& stop_token_ids = {},
+        struct llama_kv_cache* target_kv = nullptr,
+        struct llama_kv_cache* draft_kv = nullptr
     );
 
     // Fallback autoregressive（draft model 不可用或全部拒绝时）
@@ -81,8 +82,8 @@ public:
         std::vector<int32_t>& output_ids,
         int32_t& start,
         float temperature,
-        const std::vector<int32_t>& stop_token_ids,
-        llama_kv_cache& target_kv
+        const std::vector<int32_t>& stop_token_ids = {},
+        struct llama_kv_cache* target_kv = nullptr
     );
 
     // Rejection sampling（核心算法，可独立测试）
