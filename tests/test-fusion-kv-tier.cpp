@@ -19,6 +19,9 @@
 #include <vector>
 #include <random>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -188,21 +191,118 @@ static void test_ssd_roundtrip() {
 
     // Promote 回 L1
     EXPECT(mgr.promote_to_cpu(0, 0, 64), "promote L2→L1");
-    // Skeleton note: read_ssd_block is a no-op that zero-fills the L1 buffer.
-    // Real impl (W1 D3) will memcpy SSD contents back.  For now we just verify
-    // the buffer is deterministically zero after promote (proves no stale data
-    // leaks back into L1).
+    // W1 D3 real impl: read_ssd_block does pread() from the SSD file we
+    // pwrite'd in flush_to_ssd.  Roundtrip should preserve the pattern.
     EXPECT(mgr.get(0, 0, 64).ptr != nullptr, "L1 ptr valid after promote");
-    int zero_count = 0;
-    const float* rb = (const float*)mgr.get(0, 0, 64).ptr;
-    for (int i = 0; i < n_elements; ++i) if (rb[i] == 0.0f) zero_count++;
-    EXPECT(zero_count == n_elements, "skeleton: L1 buffer zero-filled on read (real impl will memcpy)");
+    EXPECT(check_pattern((float*)mgr.get(0, 0, 64).ptr, n_elements, seed),
+           "roundtrip data preserved (real SSD read)");
 
     // Clean up
     char rm_cmd[300];
     snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf %s", ssd_path);
     (void)!system(rm_cmd);
 
+    ggml_free(ctx);
+}
+
+// ============================================================
+// Test 4b: Real SSD file layout (W1 D3 — verify on-disk file)
+// ============================================================
+// Exercises the actual on-disk SSD files (created by set_ssd_path) and
+// verifies: (1) file is created with the correct size, (2) data written via
+// the manager can be read back via plain pread, (3) mlock path doesn't crash
+// even when called many times.  This is the bridge to W1 D4 llama.cpp
+// integration: the file format we use here will be what attention hooks read.
+static void test_real_ssd_files() {
+    printf("\n=== Test 4b: Real SSD file layout (W1 D3) ===\n");
+    const int n_layers = 2;
+    const int kv_size = 256;
+    const int head_dim = 32;
+    const int block_size = 128;  // 128 * 32 * 4 (F32) = 16 KB per block
+
+    ggml_init_params params = { 32 * 1024 * 1024, nullptr, true };
+    ggml_context* ctx = ggml_init(params);
+    fusion::FusionKVTierManager mgr(ctx, n_layers, kv_size, head_dim, GGML_TYPE_F32, block_size);
+
+    char ssd_path[256];
+    snprintf(ssd_path, sizeof(ssd_path), "/tmp/fusion_kv_tier_disk_%d", getpid());
+    // Clean any prior state so ftruncate path is exercised
+    char rm_cmd[300];
+    snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf %s", ssd_path);
+    (void)!system(rm_cmd);
+
+    mgr.set_ssd_path(ssd_path);
+
+    // (1) Verify SSD files exist with correct size on disk
+    // 2 layers × 2 blocks (256/128) × 16 KB = 32 KB data per layer
+    // + 4 KB header each = 36 KB per file
+    int n_blocks = (kv_size + block_size - 1) / block_size;
+    size_t expected_data = (size_t)n_blocks * block_size * head_dim * 4;  // F32
+    size_t expected_file = 4 * 1024 + expected_data;
+
+    for (int il = 0; il < n_layers; ++il) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/layer_%03d.bin", ssd_path, il);
+        struct stat st;
+        EXPECT(stat(path, &st) == 0, "SSD file exists on disk");
+        EXPECT((size_t)st.st_size == expected_file, "SSD file has expected size");
+        if (st.st_size != (off_t)expected_file) {
+            fprintf(stderr, "    expected=%zu, got=%lld\n", expected_file, (long long)st.st_size);
+        }
+    }
+
+    // (2) Write a pattern via the manager, then read raw from disk
+    EXPECT(mgr.promote_to_cpu(0, 0, kv_size), "promote layer 0 to L1");
+    int n_elements = block_size * head_dim;
+    std::mt19937 rng(123);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    float* l1_ptr = (float*)mgr.get(0, 0, block_size).ptr;
+    for (int i = 0; i < n_elements; ++i) l1_ptr[i] = nd(rng);
+    EXPECT(mgr.flush_to_ssd(0, 0, block_size), "flush to SSD");
+
+    // Open the SSD file externally and pread — verify the data we wrote
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/layer_%03d.bin", ssd_path, 0);
+    int fd = open(path, O_RDONLY);
+    EXPECT(fd >= 0, "external open of SSD file");
+    if (fd >= 0) {
+        std::vector<float> external(n_elements);
+        // File offset: 4 KB header + block 0
+        ssize_t got = pread(fd, external.data(), n_elements * sizeof(float), 4 * 1024);
+        EXPECT((size_t)got == n_elements * sizeof(float), "external pread got full block");
+        // Re-generate expected and compare
+        std::mt19937 rng2(123);
+        std::normal_distribution<float> nd2(0.0f, 1.0f);
+        bool matches = true;
+        for (int i = 0; i < n_elements; ++i) {
+            float expected = nd2(rng2);
+            if (std::fabs(external[i] - expected) > 1e-6f) { matches = false; break; }
+        }
+        EXPECT(matches, "external pread data matches what manager wrote");
+        close(fd);
+    }
+
+    // (3) Multiple promote/demote cycle exercises mlock path
+    for (int cycle = 0; cycle < 5; ++cycle) {
+        EXPECT(mgr.demote_to_ssd(0, 0, block_size), "cycle: demote");
+        // Overwrite L1 to verify next read actually pulls from SSD
+        memset(mgr.get(0, 0, block_size).ptr, 0xAB, n_elements * sizeof(float));
+        EXPECT(mgr.promote_to_cpu(0, 0, block_size), "cycle: promote");
+        // After promote, the data we wrote should be back (not 0xAB)
+        std::mt19937 rng3(123);
+        std::normal_distribution<float> nd3(0.0f, 1.0f);
+        bool cycle_ok = true;
+        float* rb = (float*)mgr.get(0, 0, block_size).ptr;
+        for (int i = 0; i < n_elements; ++i) {
+            float expected = nd3(rng3);
+            if (std::fabs(rb[i] - expected) > 1e-6f) { cycle_ok = false; break; }
+        }
+        EXPECT(cycle_ok, "5x promote/demote preserves data");
+    }
+
+    // Clean up
+    snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf %s", ssd_path);
+    (void)!system(rm_cmd);
     ggml_free(ctx);
 }
 
@@ -381,6 +481,7 @@ int main(int argc, char** argv) {
     test_promote_paths();
     test_demote_paths();
     test_ssd_roundtrip();
+    test_real_ssd_files();
     test_multi_layer();
     test_stats();
     test_large_kv();

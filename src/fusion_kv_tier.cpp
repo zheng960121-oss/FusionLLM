@@ -10,7 +10,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <cerrno>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
 
 // ggml type size helper
 extern "C" {
@@ -73,16 +77,21 @@ FusionKVTierManager::FusionKVTierManager(
     l0_v_tensors_.resize(n_layers_, nullptr);
     l0_max_tokens_ = 0;
 
-    // 4) SSD paths
+    // 4) SSD paths + file descriptors
     ssd_file_paths_.resize(n_layers_);
     ssd_mmapped_.resize(n_layers_, nullptr);
+    ssd_fds_.assign(n_layers_, -1);  // -1 = not open
 }
 
 FusionKVTierManager::~FusionKVTierManager() {
     fprintf(stderr, "[KVTier] destroying\n");
-    // Free L1 buffers
-    for (auto* p : l1_buffers_) {
-        if (p) free(p);
+    // Free L1 buffers (also munlock: calloc memory is not mlock'd by default,
+    // but mlock we did in read_ssd_block needs undoing).
+    for (size_t i = 0; i < l1_buffers_.size(); ++i) {
+        if (l1_buffers_[i]) {
+            munlock(l1_buffers_[i], l1_buffer_sizes_[i]);
+            free(l1_buffers_[i]);
+        }
     }
     // Munmap SSD
     for (size_t i = 0; i < ssd_mmapped_.size(); ++i) {
@@ -91,6 +100,11 @@ FusionKVTierManager::~FusionKVTierManager() {
             ssd_mmapped_[i] = nullptr;
         }
     }
+    // Close SSD fds
+    for (int fd : ssd_fds_) {
+        if (fd >= 0) close(fd);
+    }
+    ssd_fds_.clear();
     // ggml tensors in L0 are freed by ggml_context (caller's responsibility)
 }
 
@@ -110,12 +124,45 @@ void FusionKVTierManager::set_ssd_path(const std::string& ssd_dir) {
         }
     }
 
-    // Set per-layer file paths
+    // Per-layer file size: 4 KB header + n_blocks * block_byte_size
+    // (4 KB reserved for future KVBlockMeta magic + version + checksum)
+    const size_t header_size = 4 * 1024;
+    const size_t per_block = block_byte_size();
+    const int n_blocks = n_blocks_per_layer();
+    const size_t file_size = header_size + (size_t)n_blocks * per_block;
+
+    // Set per-layer file paths + open fds
+    int opened = 0;
     for (int il = 0; il < n_layers_; ++il) {
         char path[1024];
         snprintf(path, sizeof(path), "%s/layer_%03d.bin", ssd_dir_.c_str(), il);
         ssd_file_paths_[il] = path;
+
+        // Open with O_RDWR | O_CREAT so we can both read (promote) and write
+        // (demote).  Mode 0644 = owner RW, group/other R.
+        int fd = open(path, O_RDWR | O_CREAT, 0644);
+        if (fd < 0) {
+            fprintf(stderr, "[KVTier]   open(%s) failed: errno=%d %s\n", path, errno, strerror(errno));
+            ssd_fds_[il] = -1;
+            continue;
+        }
+        // Resize to expected size if smaller
+        struct stat fst;
+        if (fstat(fd, &fst) == 0 && (size_t)fst.st_size < file_size) {
+            if (ftruncate(fd, (off_t)file_size) != 0) {
+                fprintf(stderr, "[KVTier]   ftruncate(%s, %zu) failed: errno=%d %s\n",
+                        path, file_size, errno, strerror(errno));
+                close(fd);
+                ssd_fds_[il] = -1;
+                continue;
+            }
+        }
+        ssd_fds_[il] = fd;
+        opened++;
     }
+    fprintf(stderr, "[KVTier]   opened %d/%d SSD files in %s (per-file=%.2f MB)\n",
+            opened, n_layers_, ssd_dir_.c_str(),
+            (double)file_size / (1024.0 * 1024.0));
 }
 
 bool FusionKVTierManager::flush_all_to_ssd() {
@@ -351,38 +398,95 @@ bool FusionKVTierManager::do_demote_to_ssd(int layer_id, int block_id) {
     return true;
 }
 
+// SSD file layout (per layer):
+//   [0 .. 4KB)                    : reserved header (KVBlockMeta magic + version + checksum)
+//   [4KB + b*block_byte_size, 4KB + (b+1)*block_byte_size) : block b raw data
+static constexpr size_t SSD_HEADER_SIZE = 4 * 1024;
+static inline off_t ssd_block_offset(int block_id, size_t block_byte_size) {
+    return (off_t)SSD_HEADER_SIZE + (off_t)block_id * (off_t)block_byte_size;
+}
+
 bool FusionKVTierManager::write_ssd_block(int layer_id, int block_id) {
-    // TODO W1 D3: 写 SSD file (real impl: open + lseek + write + fsync + close)
-    //  1) open(ssd_file_paths_[il], O_WRONLY|O_CREAT)
-    //  2) lseek 到 block offset
-    //  3) write l1_buffers_[il] + block offset
-    //  4) fsync
-    //  5) close
-    if (ssd_file_paths_[layer_id].empty()) {
-        fprintf(stderr, "[KVTier] STUB: write_ssd_block(layer=%d, block=%d) - no SSD path set, no-op\n",
-                layer_id, block_id);
-        return true;  // skeleton: don't fail when SSD path not set
+    if (ssd_fds_.empty() || layer_id >= (int)ssd_fds_.size() || ssd_fds_[layer_id] < 0) {
+        // No SSD path set or open failed — skeleton fallback (no-op)
+        if (!ssd_file_paths_.empty() && !ssd_file_paths_[layer_id].empty()) {
+            fprintf(stderr, "[KVTier] write_ssd_block(layer=%d, block=%d) - fd invalid, no-op\n",
+                    layer_id, block_id);
+        }
+        return true;
     }
-    fprintf(stderr, "[KVTier] STUB: write_ssd_block(layer=%d, block=%d, file=%s)\n",
-            layer_id, block_id, ssd_file_paths_[layer_id].c_str());
+    int fd = ssd_fds_[layer_id];
+    size_t bsz = block_byte_size();
+    size_t buffer_offset = (size_t)block_id * bsz;
+    off_t file_offset = ssd_block_offset(block_id, bsz);
+
+    // pwrite is thread-safe; we don't need a lock for concurrent writers to
+    // different blocks because each block has a unique file offset.
+    ssize_t written = pwrite(fd, (const char*)l1_buffers_[layer_id] + buffer_offset,
+                              bsz, file_offset);
+    if (written < 0 || (size_t)written != bsz) {
+        fprintf(stderr, "[KVTier] write_ssd_block(layer=%d, block=%d, fd=%d) failed: "
+                "wrote %zd/%zu bytes, errno=%d %s\n",
+                layer_id, block_id, fd, written, bsz, errno, strerror(errno));
+        return false;
+    }
+    // Best-effort: don't fsync per block (10x+ slower on macOS).  flush_all_to_ssd()
+    // can call fsync() at the end of a batch if the caller wants durability.
     return true;
 }
 
 bool FusionKVTierManager::read_ssd_block(int layer_id, int block_id) {
-    // TODO W1 D3: 读 SSD file (real impl: open + mmap + memcpy + mlock)
-    //  1) open ssd_file_paths_[il]
-    //  2) mmap (PoC-4 已验证)
-    //  3) memcpy to l1_buffers_[il] + offset
-    //  4) mlock (or posix_madvise SEQUENTIAL)
-    if (ssd_file_paths_[layer_id].empty()) {
-        fprintf(stderr, "[KVTier] STUB: read_ssd_block(layer=%d, block=%d) - no SSD path set, no-op (zero buffer)\n",
-                layer_id, block_id);
-        // Skeleton: zero-fill destination so caller gets deterministic data
-        size_t offset = (size_t)block_id * block_byte_size();
-        memset((char*)l1_buffers_[layer_id] + offset, 0, block_byte_size());
+    if (ssd_fds_.empty() || layer_id >= (int)ssd_fds_.size() || ssd_fds_[layer_id] < 0) {
+        // No SSD path set — zero-fill destination so caller gets deterministic data
+        size_t bsz = block_byte_size();
+        size_t buffer_offset = (size_t)block_id * bsz;
+        if (!l1_buffers_.empty() && l1_buffers_[layer_id]) {
+            memset((char*)l1_buffers_[layer_id] + buffer_offset, 0, bsz);
+        }
         return true;
     }
-    fprintf(stderr, "[KVTier] STUB: read_ssd_block(layer=%d, block=%d)\n", layer_id, block_id);
+    int fd = ssd_fds_[layer_id];
+    size_t bsz = block_byte_size();
+    size_t buffer_offset = (size_t)block_id * bsz;
+    off_t file_offset = ssd_block_offset(block_id, bsz);
+
+    // Read into the L1 buffer at the block's offset
+    ssize_t got = pread(fd, (char*)l1_buffers_[layer_id] + buffer_offset,
+                         bsz, file_offset);
+    if (got < 0) {
+        fprintf(stderr, "[KVTier] read_ssd_block(layer=%d, block=%d, fd=%d) failed: "
+                "errno=%d %s\n",
+                layer_id, block_id, fd, errno, strerror(errno));
+        return false;
+    }
+    if ((size_t)got < bsz) {
+        // Short read: file is shorter than expected (just-created or partial).
+        // Zero the unread tail and treat as success.  This is the documented
+        // behavior for blocks that haven't been written yet.
+        memset((char*)l1_buffers_[layer_id] + buffer_offset + got, 0, bsz - (size_t)got);
+    }
+
+    // mlock the L1 buffer pages for this block.  mlock requires page-aligned
+    // addresses, so expand the range to cover the whole page(s) that contain
+    // the block.  The L1 buffer comes from calloc() which returns 16-byte
+    // aligned memory; for the typical block_byte_size (>= 4 KB) the block
+    // itself is page-aligned.  For smaller blocks we round down/up.
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg > 0) {
+        uintptr_t base_addr = (uintptr_t)l1_buffers_[layer_id];
+        uintptr_t block_start_addr = base_addr + buffer_offset;
+        uintptr_t page_start = block_start_addr & ~((uintptr_t)pg - 1);
+        uintptr_t block_end_addr = block_start_addr + bsz;
+        uintptr_t page_end = (block_end_addr + (uintptr_t)pg - 1) & ~((uintptr_t)pg - 1);
+        size_t lock_size = (size_t)(page_end - page_start);
+        if (mlock((void*)page_start, lock_size) != 0) {
+            // mlock failure is non-fatal (it'll just fall back to swap on
+            // pressure).  Log at low verbosity.
+            fprintf(stderr, "[KVTier] mlock(layer=%d, block=%d, %zu bytes) failed: "
+                    "errno=%d %s (block still works, but may swap)\n",
+                    layer_id, block_id, lock_size, errno, strerror(errno));
+        }
+    }
     return true;
 }
 

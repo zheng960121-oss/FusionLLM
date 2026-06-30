@@ -206,6 +206,7 @@ private:
     std::string ssd_dir_;
     std::vector<std::string> ssd_file_paths_;  // per layer
     std::vector<void*> ssd_mmapped_;           // mmap'd regions
+    std::vector<int>   ssd_fds_;               // open fds per layer (-1 if not open)
 
     // Sliding window
     int sliding_window_size_ = 0;
