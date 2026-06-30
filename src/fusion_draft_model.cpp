@@ -299,33 +299,39 @@ static ggml_tensor* dspark_attention_forward(
     q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
 
     // ==== K branch (target context + draft noise concat along seq dim) ====
+    // NOTE: DSpark draft stores K/V weights as full [n_embd, n_embd] (no GQA
+    // reduction).  The GGUF metadata reports n_head_kv=2 for Qwen2.5-0.5B
+    // (matching the original target model) but the actual draft weights
+    // are full MHA.  So we use n_head for the K/V reshape.
+    const int n_kv_heads = n_head;  // full MHA in DSpark draft
+
     ggml_tensor* k_ctx = ggml_mul_mat(ctx, w.wk, target_hs);
-    k_ctx = ggml_reshape_4d(ctx, k_ctx, head_dim, n_head_kv, ctx_len, 1);
+    k_ctx = ggml_reshape_4d(ctx, k_ctx, head_dim, n_kv_heads, ctx_len, 1);
 
     ggml_tensor* k_noise = ggml_mul_mat(ctx, w.wk, hidden_states);
-    k_noise = ggml_reshape_4d(ctx, k_noise, head_dim, n_head_kv, q_len, 1);
+    k_noise = ggml_reshape_4d(ctx, k_noise, head_dim, n_kv_heads, q_len, 1);
 
-    // Concat along sequence dim: ne = [head_dim, n_head_kv, ctx_len+q_len, B]
+    // Concat along sequence dim: ne = [head_dim, n_kv_heads, ctx_len+q_len, B]
     ggml_tensor* k = ggml_concat(ctx, k_ctx, k_noise, 2);
 
-    // per-head RMSNorm on K (apply on ne=[head_dim, n_head_kv, ctx_len+q_len, B])
+    // per-head RMSNorm on K (apply on ne=[head_dim, n_kv_heads, ctx_len+q_len, B])
     k = rms_norm_weighted(ctx, k, w.attn_k_norm);
     k = ggml_cont(ctx, k);
 
     // RoPE on full concat sequence; position_ids covers ctx_len+q_len entries.
-    // K ne=[head_dim, n_head_kv, ctx_len+q_len, B], so we view position_ids
+    // K ne=[head_dim, n_kv_heads, ctx_len+q_len, B], so we view position_ids
     // to length ctx_len+q_len (already same as total, so just use full).
     ggml_tensor* pos_kv = ggml_view_1d(ctx, position_ids, ctx_len + q_len, 0);
     k = ggml_rope(ctx, k, pos_kv, head_dim, 0);
 
-    // Permute to [head_dim, ctx_len+q_len, n_head_kv, B] for SDPA.
+    // Permute to [head_dim, ctx_len+q_len, n_kv_heads, B] for SDPA.
     k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
 
     // ==== V branch (same concat pattern, no RoPE/norm) ====
     ggml_tensor* v_ctx = ggml_mul_mat(ctx, w.wv, target_hs);
-    v_ctx = ggml_reshape_4d(ctx, v_ctx, head_dim, n_head_kv, ctx_len, 1);
+    v_ctx = ggml_reshape_4d(ctx, v_ctx, head_dim, n_kv_heads, ctx_len, 1);
     ggml_tensor* v_noise = ggml_mul_mat(ctx, w.wv, hidden_states);
-    v_noise = ggml_reshape_4d(ctx, v_noise, head_dim, n_head_kv, q_len, 1);
+    v_noise = ggml_reshape_4d(ctx, v_noise, head_dim, n_kv_heads, q_len, 1);
     ggml_tensor* v = ggml_concat(ctx, v_ctx, v_noise, 2);
     v = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
 
@@ -335,10 +341,9 @@ static ggml_tensor* dspark_attention_forward(
     float scale = 1.0f / sqrtf((float)head_dim);
     ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
 
-    // attn_out: [head_dim, q_len, n_head, 1] (from ggml_flash_attn_ext output shape)
-    // Permute to [head_dim, n_head, q_len, 1] for reshape to 2D
-    attn_out = ggml_cont(ctx, ggml_permute(ctx, attn_out, 0, 2, 1, 3));
-    // Reshape to [q_dim, q_len] where q_dim = n_head * head_dim (handles GQA where q_dim != n_embd)
+    // attn_out: [n_embd_v=head_dim, n_head, n_batch=q_len, ne3] per ggml doc
+    // (already permuted by flash_attn_ext — no extra permute needed)
+    attn_out = ggml_cont(ctx, attn_out);
     const int64_t q_dim = (int64_t) n_head * head_dim;
     ggml_tensor* attn_2d = ggml_reshape_2d(ctx, attn_out, q_dim, q_len);
 
