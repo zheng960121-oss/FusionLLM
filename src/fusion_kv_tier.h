@@ -183,6 +183,7 @@ public:
     // All layers share the same kv_size in our model, so a single getter
     // suffices.
     int kv_size_for_layer() const { return kv_size_; }
+    int sliding_window_size() const { return sliding_window_size_ > 0 ? sliding_window_size_ : kv_size_ / 4; }
 
     // ============================================================
     // Debug / Logging

@@ -571,12 +571,14 @@ bool FusionKVTierManager::ensure_l0_buffers(int max_tokens) {
     // L0 staging cap.  Allocating a per-layer ggml tensor of size
     // [head_dim × kv_size] for every layer explodes Metal memory at long
     // contexts (16K → 306 MB just for L0, on top of 312 MB compute buffer).
-    // Cap L0 at this many tokens; callers needing longer ranges will get a
-    // smaller L0 view + the rest stays in L1 (CPU) or L2 (SSD).  W2 will
-    // add sliding-window-aware ranges that only need the hot subset.
-    static constexpr int L0_TOKENS_CAP = 4096;
+    //
+    // W2: L0 size = sliding_window_size_ (default = kv_size/4).  This way
+    // the L0 tensor holds only the sliding window of hot tokens, the rest
+    // stays in L1 (CPU) or L2 (SSD).  advance_window() then demotes
+    // blocks leaving the window and promotes new ones entering.
+    int cap = sliding_window_size_ > 0 ? sliding_window_size_ : 4096;
     int alloc_tokens = max_tokens;
-    if (alloc_tokens > L0_TOKENS_CAP) alloc_tokens = L0_TOKENS_CAP;
+    if (alloc_tokens > cap) alloc_tokens = cap;
 
     // If tensors are already allocated but smaller, we need a fresh context
     // to realloc — but our ctx_ is caller-owned.  Strategy: allocate the full
@@ -599,10 +601,10 @@ bool FusionKVTierManager::ensure_l0_buffers(int max_tokens) {
         if (l0_v_tensors_[il]) ggml_format_name(l0_v_tensors_[il], "%s", name_v);
     }
     l0_max_tokens_ = alloc_tokens;
-    fprintf(stderr, "[KVTier] L0 buffers allocated: %d layers × [%d, %d] = %.2f MB/layer (cap=%d)\n",
+    fprintf(stderr, "[KVTier] L0 buffers allocated: %d layers × [%d, %d] = %.2f MB/layer (window=%d)\n",
             n_layers_, kv_head_dim_, alloc_tokens,
             (double)kv_head_dim_ * alloc_tokens * ggml_type_size(kv_type_) / (1024.0 * 1024.0),
-            L0_TOKENS_CAP);
+            cap);
     return true;
 }
 
