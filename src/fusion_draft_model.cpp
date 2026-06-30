@@ -84,7 +84,8 @@ bool FusionDSparkModel::parse_metadata(const struct gguf_context* gctx) {
 // ---------- Weight loading ----------
 
 bool FusionDSparkModel::load_weights(const struct ggml_context* ctx, const struct gguf_context* gctx) {
-    fprintf(stderr, "[FusionDSpark] load_weights: TODO (placeholder, real loading in S9)\n");
+    fprintf(stderr, "[FusionDSpark] load_weights: loading %d draft layers + heads\n",
+            cfg_.num_draft_layers);
     weights_.layers.resize(cfg_.num_draft_layers);
 
     if (cfg_.markov_rank > 0) {
@@ -93,7 +94,102 @@ bool FusionDSparkModel::load_weights(const struct ggml_context* ctx, const struc
         else if (cfg_.markov_head_type == "rnn") weights_.markov_head.type = MarkovHeadType::RNN;
         weights_.markov_head.rank = cfg_.markov_rank;
     }
-    (void)ctx; (void)gctx;
+
+    if (cfg_.enable_confidence_head) {
+        // Note: config has enable_confidence_head but no with_markov flag in struct
+        // Markov coupling is handled inside apply_markov_head caller
+    }
+
+    if (!ctx) {
+        fprintf(stderr, "[FusionDSpark] load_weights: no ggml ctx provided\n");
+        return false;
+    }
+
+    // Lookup helper: get a tensor from ggml_context by name. Returns nullptr
+    // if the tensor doesn't exist in the GGUF (e.g. optional tensors).
+    auto get = [&](const char* name) -> ggml_tensor* {
+        return ggml_get_tensor((ggml_context*) ctx, name);
+    };
+
+    int n_found = 0, n_missing = 0;
+
+    // 1) Embedding + LM head (note: usually shared with target, can be nullptr)
+    weights_.embed_tokens = get("embed_tokens.weight");
+    if (weights_.embed_tokens) n_found++; else n_missing++;
+
+    weights_.lm_head = get("lm_head.weight");
+    if (weights_.lm_head) n_found++; else n_missing++;
+
+    // 2) FC + hidden_norm + final_norm
+    weights_.fc = get("fc.weight");
+    if (weights_.fc) n_found++; else n_missing++;
+
+    weights_.hidden_norm = get("hidden_norm.weight");
+    if (weights_.hidden_norm) n_found++; else n_missing++;
+
+    weights_.final_norm = get("norm.weight");
+    if (weights_.final_norm) n_found++; else n_missing++;
+
+    // 3) Per-layer weights
+    for (int il = 0; il < cfg_.num_draft_layers; ++il) {
+        DSparkLayerWeights& w = weights_.layers[il];
+        char name[256];
+
+        // Attention projections + norms
+        snprintf(name, sizeof(name), "layers.%d.attn_q.weight", il);
+        w.wq = get(name);
+        snprintf(name, sizeof(name), "layers.%d.attn_k.weight", il);
+        w.wk = get(name);
+        snprintf(name, sizeof(name), "layers.%d.attn_v.weight", il);
+        w.wv = get(name);
+        snprintf(name, sizeof(name), "layers.%d.attn_output.weight", il);
+        w.wo = get(name);
+        snprintf(name, sizeof(name), "layers.%d.attn_q_norm.weight", il);
+        w.attn_q_norm = get(name);
+        snprintf(name, sizeof(name), "layers.%d.attn_k_norm.weight", il);
+        w.attn_k_norm = get(name);
+
+        // FFN
+        snprintf(name, sizeof(name), "layers.%d.ffn_gate.weight", il);
+        w.ffn_gate = get(name);
+        snprintf(name, sizeof(name), "layers.%d.ffn_up.weight", il);
+        w.ffn_up = get(name);
+        snprintf(name, sizeof(name), "layers.%d.ffn_down.weight", il);
+        w.ffn_down = get(name);
+
+        // Norms
+        snprintf(name, sizeof(name), "layers.%d.input_layernorm.weight", il);
+        w.input_layernorm = get(name);
+        snprintf(name, sizeof(name), "layers.%d.post_attention_layernorm.weight", il);
+        w.post_attention_layernorm = get(name);
+
+        if (w.wq && w.wk && w.wv && w.wo &&
+            w.attn_q_norm && w.attn_k_norm &&
+            w.ffn_gate && w.ffn_up && w.ffn_down &&
+            w.input_layernorm && w.post_attention_layernorm) {
+            n_found += 11;
+        } else {
+            fprintf(stderr, "[FusionDSpark] WARNING: layer %d has missing weights (running in skeleton mode)\n", il);
+            n_missing += 11;
+        }
+    }
+
+    // 4) Markov head
+    if (cfg_.markov_rank > 0 && weights_.markov_head.type == MarkovHeadType::VANILLA) {
+        weights_.markov_head.markov_w1 = get("markov_head.markov_w1.weight");
+        weights_.markov_head.markov_w2 = get("markov_head.markov_w2.weight");
+        if (weights_.markov_head.markov_w1) n_found++; else n_missing++;
+        if (weights_.markov_head.markov_w2) n_found++; else n_missing++;
+    }
+
+    // 5) Confidence head
+    if (cfg_.enable_confidence_head) {
+        weights_.confidence_head.proj = get("confidence_head.proj.weight");
+        if (weights_.confidence_head.proj) n_found++; else n_missing++;
+    }
+
+    fprintf(stderr, "[FusionDSpark] weights loaded: %d found, %d missing\n", n_found, n_missing);
+    (void)gctx;  // kept for API compat; tensors live in weights_ctx_ now
     return true;
 }
 
@@ -112,7 +208,13 @@ bool FusionDSparkModel::load_from_gguf(const std::string& path) {
 
     fprintf(stderr, "[FusionDSpark] loading from %s\n", path.c_str());
 
-    struct gguf_init_params iparams = { true, nullptr };
+    // Allocate a ggml context via GGUF init (will auto-load + register all tensors).
+    // params.ctx = &weights_ctx_ means GGUF creates weights_ctx_ and stores all
+    // tensor metadata + data pointers inside it.
+    struct gguf_init_params iparams = {
+        /*.no_alloc =*/ false,
+        /*.ctx      =*/ &weights_ctx_,
+    };
     struct gguf_context* gctx = gguf_init_from_file(path.c_str(), iparams);
     if (!gctx) {
         fprintf(stderr, "[FusionDSpark] failed to open GGUF: %s\n", path.c_str());
@@ -120,11 +222,13 @@ bool FusionDSparkModel::load_from_gguf(const std::string& path) {
     }
 
     if (!parse_metadata(gctx)) {
+        ggml_free(weights_ctx_); weights_ctx_ = nullptr;
         gguf_free(gctx);
         return false;
     }
 
-    if (!load_weights(nullptr, gctx)) {
+    if (!load_weights(weights_ctx_, gctx)) {
+        ggml_free(weights_ctx_); weights_ctx_ = nullptr;
         gguf_free(gctx);
         return false;
     }
@@ -176,38 +280,48 @@ static ggml_tensor* dspark_attention_forward(
 ) {
     (void)il;
 
-    // 1. Q projection from draft input only
-    // ggml_mul_mat: [n_embd_out, K] × [K, M] = [n_embd_out, M]
-    // wq shape: [n_embd, n_embd]; hidden_states [n_embd, q_len] -> q [n_embd, q_len]
+    // ==== Q branch ====
+    // 1. Q projection from draft input only: wq ne=[q_dim, n_embd], hidden_states ne=[n_embd, q_len, B]
+    //    mul_mat yields ne = [q_dim, q_len*B] which we then reshape.
     ggml_tensor* q = ggml_mul_mat(ctx, w.wq, hidden_states);
-    // Reshape to [head_dim, n_head, q_len, B]
+    // Reshape to [head_dim, n_head, q_len, B] (ne[2] = q_len so ggml_rope matches)
     q = ggml_reshape_4d(ctx, q, head_dim, n_head, q_len, 1);
-    // Permute to [head_dim, q_len, n_head, B] for SDPA
-    q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
 
-    // per-head RMSNorm on Q
+    // per-head RMSNorm on Q (apply on ne=[head_dim, n_head, q_len, B])
     q = rms_norm_weighted(ctx, q, w.attn_q_norm);
     q = ggml_cont(ctx, q);
 
-    // 2. K from target context (use n_head_kv since GQA)
+    // RoPE BEFORE permute so that ne[2] = q_len matches position_ids view size.
+    // Q is from draft only, so we take the LAST q_len positions of position_ids.
+    ggml_tensor* pos_q = ggml_view_1d(ctx, position_ids, q_len, ctx_len * sizeof(int32_t));
+    q = ggml_rope(ctx, q, pos_q, head_dim, 0);
+    // Now permute to [head_dim, q_len, n_head, B] for SDPA.
+    q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+
+    // ==== K branch (target context + draft noise concat along seq dim) ====
     ggml_tensor* k_ctx = ggml_mul_mat(ctx, w.wk, target_hs);
     k_ctx = ggml_reshape_4d(ctx, k_ctx, head_dim, n_head_kv, ctx_len, 1);
 
-    // 3. K from draft noise
     ggml_tensor* k_noise = ggml_mul_mat(ctx, w.wk, hidden_states);
     k_noise = ggml_reshape_4d(ctx, k_noise, head_dim, n_head_kv, q_len, 1);
 
-    // 4. Concat K: [target_ctx, draft_noise] along sequence dim (dim=2)
+    // Concat along sequence dim: ne = [head_dim, n_head_kv, ctx_len+q_len, B]
     ggml_tensor* k = ggml_concat(ctx, k_ctx, k_noise, 2);
-    // After concat: [head_dim, n_head_kv, ctx_len+q_len, 1]
-    // Permute for SDPA: [head_dim, ctx_len+q_len, n_head_kv, 1]
-    k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
 
-    // per-head RMSNorm on K
+    // per-head RMSNorm on K (apply on ne=[head_dim, n_head_kv, ctx_len+q_len, B])
     k = rms_norm_weighted(ctx, k, w.attn_k_norm);
     k = ggml_cont(ctx, k);
 
-    // 5. V: same concat pattern (no norm)
+    // RoPE on full concat sequence; position_ids covers ctx_len+q_len entries.
+    // K ne=[head_dim, n_head_kv, ctx_len+q_len, B], so we view position_ids
+    // to length ctx_len+q_len (already same as total, so just use full).
+    ggml_tensor* pos_kv = ggml_view_1d(ctx, position_ids, ctx_len + q_len, 0);
+    k = ggml_rope(ctx, k, pos_kv, head_dim, 0);
+
+    // Permute to [head_dim, ctx_len+q_len, n_head_kv, B] for SDPA.
+    k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+
+    // ==== V branch (same concat pattern, no RoPE/norm) ====
     ggml_tensor* v_ctx = ggml_mul_mat(ctx, w.wv, target_hs);
     v_ctx = ggml_reshape_4d(ctx, v_ctx, head_dim, n_head_kv, ctx_len, 1);
     ggml_tensor* v_noise = ggml_mul_mat(ctx, w.wv, hidden_states);
@@ -215,27 +329,20 @@ static ggml_tensor* dspark_attention_forward(
     ggml_tensor* v = ggml_concat(ctx, v_ctx, v_noise, 2);
     v = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
 
-    // 6. RoPE on full sequence
-    // ggml_rope(ctx, a, b, n_dims, mode): b is int32 position_ids of size a->ne[2]
-    // After permute, k and v have shape [head_dim, ctx_len+q_len, n_head_kv, 1]
-    // ne[2] is ctx_len+q_len
-    // We use position_ids directly (DSpark uses standard RoPE)
-    // Note: actual rope_type = cfg.rope_mode (0 = NORMAL)
-    q = ggml_rope(ctx, q, position_ids, n_embd/2, 0);
-    k = ggml_rope(ctx, k, position_ids, n_embd/2, 0);
-
     // 7. SDPA / Flash Attention
     // No causal mask needed (DSpark context is bidirectional within context, causal only for new tokens)
     // Simplified: pass nullptr mask (DSpark draft is short, attention works without explicit mask)
     float scale = 1.0f / sqrtf((float)head_dim);
     ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
 
-    // attn_out: [head_dim, q_len, n_head, 1]
-    // Reshape to [n_embd, q_len, 1] for output projection
+    // attn_out: [head_dim, q_len, n_head, 1] (from ggml_flash_attn_ext output shape)
+    // Permute to [head_dim, n_head, q_len, 1] for reshape to 2D
     attn_out = ggml_cont(ctx, ggml_permute(ctx, attn_out, 0, 2, 1, 3));
-    ggml_tensor* attn_2d = ggml_reshape_2d(ctx, attn_out, n_embd, q_len);
+    // Reshape to [q_dim, q_len] where q_dim = n_head * head_dim (handles GQA where q_dim != n_embd)
+    const int64_t q_dim = (int64_t) n_head * head_dim;
+    ggml_tensor* attn_2d = ggml_reshape_2d(ctx, attn_out, q_dim, q_len);
 
-    // 8. Output projection
+    // 8. Output projection: wo has shape [n_embd, q_dim]
     ggml_tensor* out = ggml_mul_mat(ctx, w.wo, attn_2d);
     out = ggml_reshape_3d(ctx, out, n_embd, q_len, 1);
 

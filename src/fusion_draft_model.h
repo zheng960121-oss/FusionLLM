@@ -117,7 +117,9 @@ struct FusionDSparkWeights {
 class FusionDSparkModel {
 public:
     FusionDSparkModel() = default;
-    ~FusionDSparkModel() = default;
+    ~FusionDSparkModel() {
+        if (weights_ctx_) ggml_free(weights_ctx_);
+    }
 
     // 加载 draft GGUF（独立文件，例如 qwen3-4b-dspark-q4.gguf）
     bool load_from_gguf(const std::string& path);
@@ -158,6 +160,8 @@ public:
 private:
     FusionDSparkConfig cfg_;
     FusionDSparkWeights weights_;
+    // ggml context holding all weight tensors (allocated by gguf_init_from_file)
+    ggml_context* weights_ctx_ = nullptr;
     bool loaded_ = false;
     std::string model_path_;
 
