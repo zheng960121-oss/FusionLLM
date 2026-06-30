@@ -295,6 +295,16 @@ struct ggml_tensor* FusionDSparkModel::forward(
         return nullptr;
     }
 
+    // Skeleton / no-alloc guard: if the caller's ggml_context is in no_alloc mode
+    // (e.g. metadata-only / shape-test path like test-fusion-dspart-attention),
+    // we cannot actually run any ggml_mul_mat — placeholders have no data buffer
+    // and ggml will abort on the first matmul.  Return nullptr so the test sees
+    // the documented "skeleton mode" contract instead of crashing the process.
+    if (ggml_get_no_alloc(ctx)) {
+        fprintf(stderr, "[FusionDSpark] forward: ggml context is no_alloc (skeleton mode), returning nullptr\n");
+        return nullptr;
+    }
+
     // target_hs shape: [concat_dim, ctx_len, B]
     // draft_input_ids shape: [block_size, B] (int32)
     int ctx_len = (int)target_hs->ne[1];
