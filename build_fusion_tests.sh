@@ -43,6 +43,15 @@ clang++ $CXXFLAGS \
     -I "$SCRIPT_DIR/src" \
     -c "$SCRIPT_DIR/src/fusion_markov_head.cpp" \
     -o "$SCRIPT_DIR/build/obj/fusion_markov_head.o" 2>&1 | tail -3
+
+echo "=== Building Phase 3 W1 fusion_kv_tier.o (new code, not in libllama) ==="
+clang++ $CXXFLAGS \
+    -I "$LLAMA_DIR/ggml/include" \
+    -I "$LLAMA_DIR/include" \
+    -I "$LLAMA_DIR/src" \
+    -I "$SCRIPT_DIR/src" \
+    -c "$SCRIPT_DIR/src/fusion_kv_tier.cpp" \
+    -o "$SCRIPT_DIR/build/obj/fusion_kv_tier.o" 2>&1 | tail -3
 echo ""
 
 # Test: extras
@@ -97,6 +106,7 @@ build_test "test-fusion-spec-e2e"           "$test_spec_decode_extras"  "1"
 build_test "test-fusion-draft-model"        "$test_draft_model_extras"  "1"
 build_test "test-fusion-dspark-forward-real" "$test_draft_model_extras" "1"
 build_test "test-fusion-hs-extract"         "$test_hs_extract_extras"   "1"
+build_test "test-fusion-kv-tier"            "$SCRIPT_DIR/build/obj/fusion_kv_tier.o"  "0"
 
 echo ""
 echo "=== Build complete ==="
