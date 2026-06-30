@@ -111,7 +111,7 @@ int main(int argc, char** argv) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx    = kv_size;
     cp.n_threads = 8;
-    cp.n_batch  = n_prompt;  // allow big batches
+    cp.n_batch  = 512;  // fixed batch size; loop to fill context (avoids huge compute buffer)
     llama_context* ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "FAIL: ctx\n"); llama_model_free(model); return 1; }
     auto t_load = std::chrono::steady_clock::now();
@@ -119,7 +119,12 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[D5] load+ctx: %.0f ms\n", load_ms);
 
     // 3. Tier manager
-    size_t ggml_sz = 256 * 1024 * 1024;  // 256 MB for L0 staging (8B 36 layers × head_dim × kv_size)
+    // ggml context needs to hold: 2 (K+V) × n_layers × kv_size × head_dim × type_size
+    // = 2 × 36 × kv_size × 128 × 2 for 8B.  Add 64MB headroom for tensor overhead.
+    size_t l0_bytes = 2ULL * n_layers * kv_size * head_dim * 2;  // F16
+    size_t ggml_sz = l0_bytes + (64 * 1024 * 1024);
+    fprintf(stderr, "[D5] ggml_ctx size: %zu MB (L0 buffer %zu MB)\n",
+            ggml_sz / (1024 * 1024), l0_bytes / (1024 * 1024));
     struct ggml_init_params gp = { ggml_sz, nullptr, false };
     ggml_context* ggml_ctx = ggml_init(gp);
     if (!ggml_ctx) { fprintf(stderr, "FAIL: ggml_init\n"); llama_free(ctx); llama_model_free(model); return 1; }
@@ -135,29 +140,41 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[D5] tier manager attached (kv_size=%d, head_dim=%d, n_layers=%d)\n",
             kv_size, head_dim, n_layers);
 
-    // 5. Prefill: tokenize prompt, run llama_decode once with full batch
+    // 5. Prefill: tokenize prompt, run llama_decode in chunks of n_batch
     std::string prompt_text(n_prompt, 'a');  // 1 char per token (rough approx)
     std::vector<llama_token> tokens(n_prompt);
     for (int i = 0; i < n_prompt; ++i) tokens[i] = i % n_vocab;
 
-    llama_batch batch = llama_batch_init(n_prompt, 0, 1);
-    batch.n_tokens = n_prompt;
-    for (int i = 0; i < n_prompt; ++i) {
-        batch.token[i]    = tokens[i];
-        batch.pos[i]      = i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i]   = (i == n_prompt - 1);  // only need logits on last
-    }
+    int chunk_size = 512;  // matches cp.n_batch
     auto s_before_prefill = mgr.get_stats();
-    fprintf(stderr, "[D5] prefill: %d tokens in 1 batch\n", n_prompt);
     auto tp0 = std::chrono::steady_clock::now();
-    int rc = llama_decode(ctx, batch);
+    int rc = 0;
+    int n_chunks = (n_prompt + chunk_size - 1) / chunk_size;
+    for (int c = 0; c < n_chunks; ++c) {
+        int start = c * chunk_size;
+        int end   = std::min(start + chunk_size, n_prompt);
+        int n_tok = end - start;
+        llama_batch batch = llama_batch_init(n_tok, 0, 1);
+        batch.n_tokens = n_tok;
+        for (int i = 0; i < n_tok; ++i) {
+            batch.token[i]    = tokens[start + i];
+            batch.pos[i]      = start + i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i]   = (start + i == n_prompt - 1);  // only need logits on last
+        }
+        rc = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        if (rc != 0) { fprintf(stderr, "FAIL: prefill chunk %d rc=%d\n", c, rc); return 1; }
+        if ((c + 1) % 8 == 0 || c == n_chunks - 1) {
+            fprintf(stderr, "[D5] prefill chunk %d/%d done (tokens %d/%d)\n",
+                    c + 1, n_chunks, end, n_prompt);
+        }
+    }
     auto tp1 = std::chrono::steady_clock::now();
     double prefill_ms = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
-    if (rc != 0) { fprintf(stderr, "FAIL: prefill rc=%d\n", rc); return 1; }
-    fprintf(stderr, "[D5] prefill: %.0f ms (%.1f t/s)\n", prefill_ms,
-            n_prompt / (prefill_ms / 1000.0));
+    fprintf(stderr, "[D5] prefill: %d tokens in %d chunks, %.0f ms (%.1f t/s)\n",
+            n_prompt, n_chunks, prefill_ms, n_prompt / (prefill_ms / 1000.0));
     auto s_after_prefill = mgr.get_stats();
     fprintf(stderr, "[D5] prefill stats: gpu_copies=%zu (was %zu) promotions=%zu ssd_reads=%zu\n",
             s_after_prefill.n_gpu_copies, s_before_prefill.n_gpu_copies,
@@ -199,7 +216,6 @@ int main(int argc, char** argv) {
 
     // Cleanup
     fusion_kv_tier_attach(ctx, nullptr);
-    llama_batch_free(batch);
     llama_batch_free(single);
     llama_free(ctx);
     llama_model_free(model);
